@@ -34,7 +34,7 @@ Benchmark 3: massdns  -r a.txt -s 12000 -c 1  wordlist.txt  >/dev/null
   Time (mean ± σ):     616.6 ms ±   4.7 ms    [User: 25.5 ms, System: 107.8 ms]
   Range (min … max):   612.0 ms … 621.3 ms    3 runs
  
-Benchmark 4: ./senddnsqueries -interface enp6s0 -domains wordlist.txt -nameservers a.txt
+Benchmark 4: ./pugdns -interface enp6s0 -domains wordlist.txt -nameservers a.txt
   Time (mean ± σ):     186.6 ms ±   4.3 ms    [User: 33.9 ms, System: 48.7 ms]
   Range (min … max):   181.9 ms … 190.5 ms    3 runs
  
