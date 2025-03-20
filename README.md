@@ -34,7 +34,7 @@ Benchmark 4: ./senddnsqueries -interface enp6s0 -domains wordlist.txt -nameserve
   Range (min … max):   181.9 ms … 190.5 ms    3 runs
  
 Summary
-  ./senddnsqueries -interface enp6s0 -domains wordlist.txt -nameservers a.txt ran
+  ./pugdns -interface enp6s0 -domains wordlist.txt -nameservers a.txt ran
     3.30 ± 0.08 times faster than massdns  -r a.txt -s 12000 -c 1  wordlist.txt  >/dev/null
    12.59 ± 0.56 times faster than cat wordlist.txt | zdns A --retries 1 --name-servers @a.txt >/dev/null
    29.64 ± 0.69 times faster than cat wordlist.txt | dnsx -retry 1 -r a.txt
