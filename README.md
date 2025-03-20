@@ -3,7 +3,7 @@ An experimental high-performance DNS query tool built with AF_XDP for extremely 
 
 Be mindful that this is not ready yet, you need to capture the responses with tcpdump because it won't capture the responses itself. For now, you can view responses to your queries by running a command like the following:
 ```bash
-sudo tcpdump -i <interface> -s 65535 -B 4096 udp port 1234
+sudo tcpdump -i <interface> -s 65535 -B 809600 udp port 1234
 ```
 In the future, you won't need to do that ofc.
 ## Overview
