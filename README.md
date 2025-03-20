@@ -2,7 +2,7 @@
 An experimental high-performance DNS query tool built with AF_XDP for extremely fast and accurate bulk DNS lookups.
 
 Be mindful that this is not ready yet, you need to capture the responses with tcpdump because it won't capture the responses itself. For now, you can view responses to your queries by running a command like the following:
-```
+```bash
 sudo tcpdump -i <interface> -s 65535 -B 4096 udp port 1234
 ```
 In the future, you won't need to do that ofc.
@@ -21,7 +21,7 @@ The following benchmarks were performed on a AX42 Hetzner server with a 1Gbit/s 
 - pugdns was ~12.5x faster than zdns
 - pugdns was ~29.6x faster than dnsx
 
-```
+```bash
 Benchmark 1: cat wordlist.txt | dnsx -retry 1 -r a.txt
   Time (mean ± σ):      5.530 s ±  0.014 s    [User: 0.870 s, System: 1.002 s]
   Range (min … max):    5.514 s …  5.539 s    3 runs
