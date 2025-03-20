@@ -1,6 +1,11 @@
 # pugDNS
 An experimental high-performance DNS query tool built with AF_XDP for extremely fast and accurate bulk DNS lookups.
 
+Be mindful that this is not ready yet, you need to capture the responses with tcpdump because it won't capture the responses itself. For now, you can view responses to your queries by running a command like the following:
+```
+sudo tcpdump -i <interface> -s 65535 -B 4096 udp port 1234
+```
+
 ## Overview
 
 pugdns is designed for security researchers, network administrators, and penetration testers who need to perform DNS reconnaissance at scale. By leveraging AF_XDP sockets, pugdns can send DNS queries at rates significantly higher than traditional tools, making it ideal for domain discovery and DNS enumeration tasks.
