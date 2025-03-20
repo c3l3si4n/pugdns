@@ -5,7 +5,7 @@ Be mindful that this is not ready yet, you need to capture the responses with tc
 ```
 sudo tcpdump -i <interface> -s 65535 -B 4096 udp port 1234
 ```
-
+In the future, you won't need to do that ofc.
 ## Overview
 
 pugdns is designed for security researchers, network administrators, and penetration testers who need to perform DNS reconnaissance at scale. By leveraging AF_XDP sockets, pugdns can send DNS queries at rates significantly higher than traditional tools, making it ideal for domain discovery and DNS enumeration tasks.
