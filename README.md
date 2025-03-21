@@ -63,7 +63,9 @@ Looking into the accuracy and number of responses that came back, we had the fol
 ## Installation
 
 ```
-# todo
+git clone https://github.com/c3l3si4n/pugdns
+go generate && go build
+./pugdns
 ``` 
 
 ## Credits
