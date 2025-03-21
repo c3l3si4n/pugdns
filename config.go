@@ -12,6 +12,7 @@ type Config struct {
 	Nameservers []string
 	Verbose     bool
 	TextOutput  bool
+	OutputFile  string
 }
 
 // DefaultConfig returns the default configuration
@@ -26,5 +27,6 @@ func DefaultConfig() *Config {
 		DomainName:  "google.com",
 		Nameservers: []string{"8.8.8.8", "8.8.4.4"},
 		TextOutput:  false,
+		OutputFile:  "results.json",
 	}
 }

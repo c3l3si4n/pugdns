@@ -5,6 +5,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -30,6 +31,7 @@ type StatsModel struct {
 	totalPackets     uint64
 	packetsPerSec    uint64
 	avgPacketsPerSec float64
+	receivedPackets  uint64
 	progressBar      progress.Model
 	startTime        time.Time
 	duration         float64
@@ -102,8 +104,8 @@ func (m StatsModel) View() string {
 		Padding(0, 1).
 		Render("DNS QUERY STATISTICS")
 
-	stats := fmt.Sprintf("\nTotal Packets: %d\nCurrent Rate: %d pps\nAverage Rate: %.2f pps\nRuntime: %.1f seconds",
-		m.totalPackets, m.packetsPerSec, m.avgPacketsPerSec, m.duration)
+	stats := fmt.Sprintf("\nTotal Packets: %d\nReceived Packets: %d\nCurrent Rate: %d pps\nAverage Rate: %.2f pps\nRuntime: %.1f seconds",
+		m.totalPackets, m.receivedPackets, m.packetsPerSec, m.avgPacketsPerSec, m.duration)
 
 	progress := "\nProgress:\n" + m.progressBar.ViewAs(float64(m.totalPackets)/neededNumberOfPackets)
 
@@ -117,6 +119,7 @@ type statsUpdateMsg struct {
 	packetsPerSec    uint64
 	avgPacketsPerSec float64
 	duration         float64
+	receivedPackets  uint64
 }
 
 // readDomainsFromFile reads domains/nameservers from a file, one per line
@@ -214,8 +217,12 @@ func preparePackets(
 		packetMap.Set(i, buf.Bytes())
 	}
 
+	go HandleResponses(domains, config.OutputFile)
+
 	return packetMap, nil
 }
+
+var receivedPackets uint64
 
 // statsCollector handles collecting and displaying transmission statistics
 func statsCollector(xsk *xdp.Socket, stopStats <-chan struct{}, programDone chan<- struct{}, config *Config) {
@@ -276,6 +283,7 @@ func statsCollector(xsk *xdp.Socket, stopStats <-chan struct{}, programDone chan
 					packetsPerSec:    packetsSent,
 					avgPacketsPerSec: avgPPS,
 					duration:         duration,
+					receivedPackets:  receivedPackets,
 				})
 			} else {
 				// Print text statistics
@@ -298,14 +306,17 @@ func statsCollector(xsk *xdp.Socket, stopStats <-chan struct{}, programDone chan
 					packetsPerSec:    0,
 					avgPacketsPerSec: float64(totalPacketsSent) / duration,
 					duration:         duration,
+					receivedPackets:  receivedPackets,
 				})
 
 				// Give UI time to update
+				time.Sleep(100 * time.Millisecond)
 				p.Quit()
 			} else {
 				// Print final text statistics
 				fmt.Printf("\n\nTransmission complete!")
 				fmt.Printf("\nTotal Packets: %d", totalPacketsSent)
+				fmt.Printf("\nReceived Packets: %d", receivedPackets)
 				fmt.Printf("\nAverage Rate: %.2f pps", float64(totalPacketsSent)/duration)
 				fmt.Printf("\nTotal Runtime: %.1f seconds\n\n", duration)
 				programDone <- struct{}{}
@@ -463,6 +474,51 @@ func finalizeTransmission(xsk *xdp.Socket) {
 	}
 }
 
+func AppendToFile(resultsArray *dns.Msg, outputFile string) {
+
+	json, err := json.Marshal(resultsArray)
+	if err != nil {
+		log.Printf("Error marshalling results: %v", err)
+	}
+	// append to file
+	file, err := os.OpenFile(outputFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Error opening file: %v", err)
+	}
+	defer file.Close()
+	file.Write(json)
+	file.Write([]byte("\n"))
+}
+
+func HandleResponses(queriedDomains []string, outputFile string) {
+	// Create a map of domains to their responses. Once all domains are found in the haxmap, save the results to a file once finished.
+	domainAlreadyFound := make(map[string]bool)
+	resultsArray := []*dns.Msg{}
+
+	for {
+		foundAllDomains := true
+		for _, domain := range queriedDomains {
+			domainFqdn := dns.Fqdn(domain)
+			if domainAlreadyFound[domainFqdn] {
+				continue
+			}
+			foundAllDomains = false
+			foundDomain, ok := cache.Get(domainFqdn)
+			if ok {
+				domainAlreadyFound[domainFqdn] = true
+				resultsArray = append(resultsArray, foundDomain)
+				receivedPackets++
+				AppendToFile(foundDomain, outputFile)
+
+			}
+		}
+		if foundAllDomains {
+			break
+		}
+	}
+
+}
+
 func main() {
 	// Initialize configuration
 	config := DefaultConfig()
@@ -479,6 +535,8 @@ func main() {
 	flag.StringVar(&config.DomainName, "domain", config.DomainName, "Single domain to query (when not using -domains file)")
 	flag.BoolVar(&config.Verbose, "verbose", config.Verbose, "Enable verbose output")
 	flag.BoolVar(&config.TextOutput, "text", config.TextOutput, "Use simple text output instead of interactive UI")
+
+	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "File to save results to")
 	flag.Parse()
 
 	// Validate required parameters
@@ -494,6 +552,9 @@ func main() {
 		log.Fatalf("Error: couldn't find interface %s: %v", config.NIC, err)
 	}
 
+	// Start BPF receiver
+	go BpfReceiver(config)
+	<-startedBPF
 	// Use interface address if source IP not specified
 	if config.SrcIP == "" {
 		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
@@ -565,8 +626,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error during transmission: %v", err)
 	}
-
 	// Print final summary
 	fmt.Printf("\nTotal execution time: %.2f seconds\n", time.Since(startTime).Seconds())
 	fmt.Printf("Average query rate: %.2f qps\n", float64(len(domains))/(time.Since(startTime).Seconds()))
+
+	// Print final summary
+	log.Println("Transmission complete. Sleeping for 2 seconds for bpf to finish receiving packets...")
+	log.Println("Results saved to file: ", config.OutputFile)
+	time.Sleep(5 * time.Second)
+
 }

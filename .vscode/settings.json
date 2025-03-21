@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "*.embeddedhtml": "html",
+        "bpf_endian.h": "c",
+        "if_ether.h": "c",
+        "udp.h": "c"
+    }
+}
