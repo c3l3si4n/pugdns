@@ -1,8 +1,9 @@
 # pugDNS
-An experimental high-performance DNS query tool built with AF_XDP for extremely fast and accurate bulk DNS lookups.
-
+An experimental high-performance DNS query tool built with AF_XDP for extremely fast and accurate bulk DNS lookups.  
+  
 ~~Be mindful that this is not ready yet, you need to capture the responses with tcpdump because it won't capture the responses itself. For now, you can view responses to your queries by running a command like the following:~~
-~~In the future, you won't need to do that ofc.~~
+~~In the future, you won't need to do that ofc.~~  
+  
 pugDNS now has beta support for receiving DNS packets using an eBPF filter.
 
 ## Overview
