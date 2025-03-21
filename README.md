@@ -1,6 +1,11 @@
 # pugDNS
 An experimental high-performance DNS query tool built with AF_XDP for extremely fast and accurate bulk DNS lookups.
 
+Be mindful that this is not ready yet, you need to capture the responses with tcpdump because it won't capture the responses itself. For now, you can view responses to your queries by running a command like the following:
+```bash
+sudo tcpdump -i <interface> -s 65535 -B 809600 udp port 1234
+```
+In the future, you won't need to do that ofc.
 ## Overview
 
 pugdns is designed for security researchers, network administrators, and penetration testers who need to perform DNS reconnaissance at scale. By leveraging AF_XDP sockets, pugdns can send DNS queries at rates significantly higher than traditional tools, making it ideal for domain discovery and DNS enumeration tasks.
@@ -16,7 +21,7 @@ The following benchmarks were performed on a AX42 Hetzner server with a 1Gbit/s 
 - pugdns was ~12.5x faster than zdns
 - pugdns was ~29.6x faster than dnsx
 
-```
+```bash
 Benchmark 1: cat wordlist.txt | dnsx -retry 1 -r a.txt
   Time (mean ± σ):      5.530 s ±  0.014 s    [User: 0.870 s, System: 1.002 s]
   Range (min … max):    5.514 s …  5.539 s    3 runs
@@ -29,12 +34,12 @@ Benchmark 3: massdns  -r a.txt -s 12000 -c 1  wordlist.txt  >/dev/null
   Time (mean ± σ):     616.6 ms ±   4.7 ms    [User: 25.5 ms, System: 107.8 ms]
   Range (min … max):   612.0 ms … 621.3 ms    3 runs
  
-Benchmark 4: ./senddnsqueries -interface enp6s0 -domains wordlist.txt -nameservers a.txt
+Benchmark 4: ./pugdns -interface enp6s0 -domains wordlist.txt -nameservers a.txt
   Time (mean ± σ):     186.6 ms ±   4.3 ms    [User: 33.9 ms, System: 48.7 ms]
   Range (min … max):   181.9 ms … 190.5 ms    3 runs
  
 Summary
-  ./senddnsqueries -interface enp6s0 -domains wordlist.txt -nameservers a.txt ran
+  ./pugdns -interface enp6s0 -domains wordlist.txt -nameservers a.txt ran
     3.30 ± 0.08 times faster than massdns  -r a.txt -s 12000 -c 1  wordlist.txt  >/dev/null
    12.59 ± 0.56 times faster than cat wordlist.txt | zdns A --retries 1 --name-servers @a.txt >/dev/null
    29.64 ± 0.69 times faster than cat wordlist.txt | dnsx -retry 1 -r a.txt
