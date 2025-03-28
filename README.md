@@ -76,8 +76,7 @@ Looking into the accuracy and number of responses that came back, we had the fol
 | `-srcMAC`     | string | ""                          | Source MAC address (Default: auto-detected from interface)                | No       |
 | `-dstMAC`     | string | ""                          | Destination MAC address (Gateway) (Default: auto-detected via ARP/NDP)    | No       |
 | `-srcIP`      | string | ""                          | Source IP address (Default: auto-detected from interface)                 | No       |
-| `-domain`     | string | "google.com"                | Single domain to query (used if `-domains` is not specified)              | No       |
-| `-domains`    | string | ""                          | File containing domains to query (one per line)                           | No       |
+| `-domains`    | string | ""                          | File containing domains to query (one per line)                           | **Yes**  |
 | `-nameservers`| string | ""                          | File containing nameserver IPs (one per line)                             | **Yes** |
 | `-output`     | string | "results.json"              | File to save results to (pretty JSON format)                              | No       |
 | `-verbose`    | bool   | false                       | Enable verbose logging output                                             | No       |
