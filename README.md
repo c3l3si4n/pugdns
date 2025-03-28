@@ -1,4 +1,5 @@
 # pugDNS 🐾
+![pugDNS](pug.png)
 
 An experimental high-performance DNS query tool built with **AF_XDP** and **eBPF** for extremely fast and accurate bulk DNS lookups. pugDNS uses an eBPF filter to efficiently capture DNS responses directly in the kernel, complementing its high-speed query injection capabilities.
 
