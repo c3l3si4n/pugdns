@@ -76,8 +76,7 @@ Looking into the accuracy and number of responses that came back, we had the fol
 | `-srcMAC`     | string | ""                          | Source MAC address (Default: auto-detected from interface)                | No       |
 | `-dstMAC`     | string | ""                          | Destination MAC address (Gateway) (Default: auto-detected via ARP/NDP)    | No       |
 | `-srcIP`      | string | ""                          | Source IP address (Default: auto-detected from interface)                 | No       |
-| `-domain`     | string | "google.com"                | Single domain to query (used if `-domains` is not specified)              | No       |
-| `-domains`    | string | ""                          | File containing domains to query (one per line)                           | No       |
+| `-domains`    | string | ""                          | File containing domains to query (one per line)                           | **Yes**  |
 | `-nameservers`| string | ""                          | File containing nameserver IPs (one per line)                             | **Yes** |
 | `-output`     | string | "results.json"              | File to save results to (pretty JSON format)                              | No       |
 | `-verbose`    | bool   | false                       | Enable verbose logging output                                             | No       |
@@ -102,6 +101,9 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
     cd pugdns
     ```
 2.  **Install Dependencies:** Ensure you have Go (>= 1.18 recommended) and Clang/LLVM (for eBPF compilation) installed. You may also need kernel headers (`linux-headers-$(uname -r)` on Debian/Ubuntu).
+    ```
+    apt install linux-headers-$(uname -r) llvm libbpf-dev; sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm;
+    ```
 3.  **Generate eBPF code and Build:**
     ```bash
     go generate && go build
