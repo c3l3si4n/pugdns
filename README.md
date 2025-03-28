@@ -101,6 +101,9 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
     cd pugdns
     ```
 2.  **Install Dependencies:** Ensure you have Go (>= 1.18 recommended) and Clang/LLVM (for eBPF compilation) installed. You may also need kernel headers (`linux-headers-$(uname -r)` on Debian/Ubuntu).
+    ```
+    apt install linux-headers-$(uname -r) llvm; sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm;
+    ```
 3.  **Generate eBPF code and Build:**
     ```bash
     go generate && go build
