@@ -10,6 +10,7 @@ type Config struct {
 	DomainName    string
 	Nameservers   []string
 	OutputFile    string
+	MaxBatchSize  int
 	Verbose       bool
 	TextOutput    bool
 	NumWorkers    int // Added for potential future use
@@ -27,7 +28,8 @@ func DefaultConfig() *Config {
 		SrcIP:         "",
 		DomainName:    "google.com",
 		Nameservers:   []string{"8.8.8.8", "8.8.4.4"},
-		TextOutput:    false,
+		MaxBatchSize:  128,
+		TextOutput:    true,
 		OutputFile:    "results.json",
 		NumWorkers:    1,
 		PollTimeoutMs: 1, // Default to 1ms poll timeout

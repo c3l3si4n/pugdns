@@ -205,7 +205,7 @@ func packetSender(xsk *xdp.Socket, packetQueue <-chan PacketInfo, stopSignal <-c
 	defer wg.Done()
 	log.Println("Packet sender started.")
 
-	maxBatchSize := 128                       // How many packets to try sending at once
+	maxBatchSize := globalConfig.MaxBatchSize // How many packets to try sending at once
 	pollTimeout := globalConfig.PollTimeoutMs // Use configured timeout
 
 	for {
@@ -367,25 +367,25 @@ func transmitPackets(xsk *xdp.Socket, initialDomains []string, config *Config) e
 
 	// Prepare and queue initial batch
 	initialPacketsPrepared := 0
+	domainStatesMutex.Lock()
 	for _, fqdn := range fqdnDomains {
 		pktInfo, err := prepareSinglePacket(fqdn, srcIP, srcMAC, dstMAC, config.Nameservers, rng)
 		if err != nil {
 			log.Printf("Error preparing initial packet for %s: %v. Marking as failed.", fqdn, err)
-			domainStatesMutex.Lock()
 			domainStates[fqdn].Responded = false             // Ensure it's false
 			domainStates[fqdn].AttemptsMade = config.Retries // Mark as failed
-			domainStatesMutex.Unlock()
 			continue
 		}
 
 		pktInfo.Attempt = 1
 		packetQueue <- pktInfo
 		initialPacketsPrepared++
-		domainStatesMutex.Lock()
+
 		domainStates[fqdn].AttemptsMade = 1
 		domainStates[fqdn].LastAttempt = time.Now()
-		domainStatesMutex.Unlock()
+
 	}
+	domainStatesMutex.Unlock()
 	log.Printf("Queued %d initial packets.", initialPacketsPrepared)
 
 	// --- Main Management Loop ---
@@ -546,11 +546,12 @@ loop:
 	log.Println("Stopping statistics collector...")
 	close(stopStats) // Signal stats collector to stop
 	<-programDone    // Wait for stats/UI to finish
-
+	log.Println("Statistics collector stopped.")
 	// --- Final Report ---
 	finalResponded := 0
 	finalFailed := 0
 	failedDomainsList := []string{}
+	log.Println("Finalizing report...")
 	domainStatesMutex.Lock()
 	for fqdn, status := range domainStates {
 		// Final check against cache in case responses came late
@@ -569,6 +570,7 @@ loop:
 		}
 	}
 	domainStatesMutex.Unlock()
+	log.Println("Finalizing report... done")
 
 	fmt.Printf("\n--- Final Summary ---")
 	fmt.Printf("\nTotal Domains: %d", totalDomains)
@@ -613,7 +615,14 @@ func prepareSinglePacket(fqdn string, srcIP net.IP, srcMAC, dstMAC net.HardwareA
 	udp.SetNetworkLayerForChecksum(ip)
 
 	query := new(dns.Msg)
-	query.SetQuestion(fqdn, dns.TypeA) // Already FQDN
+	query.Id = uint16(rng.Intn(65535)) // Random ID like zdns
+	query.RecursionDesired = true      // Set RD bit
+	query.Question = []dns.Question{{
+		Name:   fqdn,
+		Qtype:  dns.TypeA,
+		Qclass: dns.ClassINET,
+	}}
+	query.SetEdns0(4096, false) // Add OPT record with 4096 buffer size
 	dnsPayload, err := query.Pack()
 	if err != nil {
 		return PacketInfo{}, fmt.Errorf("packing DNS query for %s: %w", fqdn, err)
@@ -709,13 +718,15 @@ func statsCollector(xsk *xdp.Socket, updateChan <-chan StatsUpdateData, stopStat
 			// ... (similar finalization logic as before) ...
 			if !config.TextOutput && p != nil {
 				// Optionally wait for a final update message or use last known state
+
 				time.Sleep(150 * time.Millisecond) // Give UI time
 				p.Quit()
 			} else if config.TextOutput {
 				fmt.Println("\n--- Final Stats ---") // Print final summary
 				// Use last received updateData or fetch final counts
-				programDone <- struct{}{}
+
 			}
+			programDone <- struct{}{}
 			log.Println("Stats collector finished.")
 			return
 		}
@@ -966,6 +977,7 @@ func main() {
 	flag.IntVar(&config.NumWorkers, "workers", config.NumWorkers, "Number of workers to use")
 	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "File to save results to")
 	flag.IntVar(&config.Retries, "retries", config.Retries, "Number of retries for each domain")
+	flag.IntVar(&config.MaxBatchSize, "maxbatch", config.MaxBatchSize, "Maximum number of packets to send at once. Default is 128. I suggest not changing this.")
 	flag.Parse()
 
 	// Validate required parameters
