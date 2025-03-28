@@ -961,7 +961,7 @@ func main() {
 	flag.StringVar(&config.SrcIP, "srcip", config.SrcIP, "Source IP address (optional, uses interface IP if empty)")
 	flag.StringVar(&config.DomainName, "domain", config.DomainName, "Single domain to query (when not using -domains file)")
 	flag.BoolVar(&config.Verbose, "verbose", config.Verbose, "Enable verbose output")
-	flag.BoolVar(&config.TextOutput, "text", config.TextOutput, "Use simple text output instead of interactive UI")
+	//flag.BoolVar(&config.TextOutput, "text", config.TextOutput, "Use simple text output instead of interactive UI")
 	flag.IntVar(&config.PollTimeoutMs, "poll", config.PollTimeoutMs, "Poll timeout in milliseconds")
 	flag.IntVar(&config.NumWorkers, "workers", config.NumWorkers, "Number of workers to use")
 	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "File to save results to")
