@@ -82,7 +82,7 @@ Looking into the accuracy and number of responses that came back, we had the fol
 | `-verbose`    | bool   | false                       | Enable verbose logging output                                             | No       |
 | `-text`       | bool   | false                       | Use simple text output instead of the default interactive UI              | No       |
 | `-poll`       | int    | 1                           | AF_XDP poll timeout in milliseconds (for TX completion)                   | No       |
-| `-workers`    | int    | *# logical CPUs* | Number of workers for processing BPF responses                            | No       |
+| `-workers`    | int    | 1 | Number of workers for processing BPF responses                            | No       |
 | `-retries`    | int    | 3                           | Number of retries for domains that don't receive a response               | No       |
 
 **Example Usage:**
