@@ -7,122 +7,136 @@
 #include <linux/ip.h>
 #include <linux/in.h>
 #include <linux/udp.h>
+#include <stddef.h>
 
-/* Structure to hold the UDP payload data */
-struct udp_event {
-    __u16 source;
-    __u16 dest;
+#define MAX_DNS_PAYLOAD 4096
+
+/* Metadata structure */
+struct dns_event_meta {
+    __u16 src_port;
+    __u16 dest_port;
     __u16 payload_size;
-    __u8 payload[1500]; // Max UDP payload size
 };
 
-/* Ring buffer for sending events to userspace */
+/* Ring buffer map */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24); // 16MB ring buffer
-    __type(value, struct udp_event);
-    // unfragmented
+    __uint(max_entries, 1 << 27); // 128MB
 } events SEC(".maps");
 
+/* Drops map */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} drops SEC(".maps");
+
 char __license[] SEC("license") = "GPL";
+
+// Define reserve_size globally as a const for clarity
+const __u64 reserve_size = sizeof(struct dns_event_meta) + MAX_DNS_PAYLOAD;
 
 SEC("xdp")
 int dump_dns_packets(struct xdp_md *ctx)
 {
     void *data_end = (void *)(long)ctx->data_end;
     void *data = (void *)(long)ctx->data;
-
-    // Verify Ethernet header fits
     struct ethhdr *eth = data;
-    if ((void*)(eth + 1) > data_end)
+    struct iphdr *ip;
+    struct udphdr *udp;
+    void *payload_start;
+    __u16 payload_size; // Actual payload size for this packet
+    __u16 dest_port_h;
+    __u32 zero = 0;
+
+    // 1. Ethernet Header Check
+    if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
 
-    // Check Ethernet protocol
+    // 2. Check for IPv4
     if (eth->h_proto != bpf_htons(ETH_P_IP))
         return XDP_PASS;
 
-    // Verify IP header fits
-    struct iphdr *ip = (void*)(eth + 1);
-    if ((void*)(ip + 1) > data_end)
+    // 3. IP Header Check
+    ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) > data_end)
         return XDP_PASS;
 
-    // Check if it's UDP
+    // 4. Check for UDP Protocol
     if (ip->protocol != IPPROTO_UDP)
         return XDP_PASS;
 
-    // Verify UDP header fits
-    struct udphdr *udp = (void*)(ip + 1);
-    if ((void*)(udp + 1) > data_end)
+    // 5. UDP Header Check (using ip->ihl)
+    udp = (void*)((__u8*)ip + (ip->ihl * 4));
+    if ((void *)(udp + 1) > data_end)
         return XDP_PASS;
 
-    // Filter for DNS traffic (port 53)
-    unsigned short src_port = 53;
-    if (bpf_ntohs(udp->source) != src_port )
+    // 6. Filter DNS Response Source Port (Port 53)
+    if (udp->source != bpf_htons(53))
         return XDP_PASS;
 
-    unsigned short dst_port = 1234;
-    if (bpf_ntohs(udp->dest) != dst_port)
+    // 7. Filter Destination Port (Ephemeral Port Range)
+    dest_port_h = bpf_ntohs(udp->dest);
+    if (dest_port_h < 1024)
         return XDP_PASS;
 
-    // Calculate UDP data length and verify
-    __u16 udp_len = bpf_ntohs(udp->len);
-    if (udp_len <= sizeof(*udp))
+    // 8. Calculate Actual UDP Payload Size for this packet
+    payload_size = bpf_ntohs(udp->len) - sizeof(*udp);
+    // Basic validation: Check if calculated size is non-positive or wraps around
+    if ((short)payload_size <= 0) { // Cast to short to catch potential wrap-around for small udp->len
         return XDP_PASS;
-    
-    __u16 payload_size = udp_len - sizeof(*udp);
-    
-    // Payload starts right after UDP header
-    void *payload_start = (void*)(udp + 1);
-    
-    // Boundary check for total payload
+    }
+
+    // 9. Payload Boundary Check (Source Packet Data)
+    payload_start = (void *)(udp + 1);
+    // Check if payload_start + payload_size (from header) exceeds packet bounds
     if (payload_start + payload_size > data_end) {
-        // Adjust payload size to what we can safely access
-        payload_size = (void*)data_end - payload_start;
-    }
-    
-    // Only process non-empty payloads
-    if (payload_size <= 0)
-        return XDP_PASS;
-    
-    // Reserve space in the ring buffer
-    struct udp_event *event = bpf_ringbuf_reserve(&events, sizeof(struct udp_event), 0);
-    if (!event)
-        return XDP_PASS;
-    
-    // Populate the event
-    event->source = bpf_ntohs(udp->source);
-    event->dest = bpf_ntohs(udp->dest);
-    event->payload_size = payload_size;
-    
-    // Copy payload data with strict bounds checking
-    // We need this approach to satisfy the verifier
-    __u32 bytes_copied = 0;
-    __u8 *payload_ptr = payload_start;
-    
-    // This loop is carefully structured to satisfy the eBPF verifier
-    #pragma unroll
-    for (int i = 0; i < 1500 && bytes_copied < payload_size; i++) {
-        if (payload_ptr + bytes_copied >= (void*)data_end)
-            break;
-            
-        event->payload[bytes_copied] = *(__u8*)(payload_ptr + bytes_copied);
-        bytes_copied++;
+         // Malformed/truncated packet according to UDP length header
+         return XDP_PASS;
     }
 
-    bpf_printk("Copied %d bytes\n", bytes_copied);
-    
-    // If we couldn't copy anything, discard the event
-    if (bytes_copied == 0) {
-        bpf_ringbuf_discard(event, 0);
+    // ***** VERIFIER FIX: Explicitly check payload_size against MAX *before* use *****
+    // Ensure the payload size we intend to copy doesn't exceed our limit.
+    // The verifier can easily track this check.
+    if (payload_size > MAX_DNS_PAYLOAD) {
+        // Payload is larger than we want to handle. We could truncate,
+        // but PASSing (dropping for our purpose) is simpler/safer.
+        // bpf_printk("BPF: Payload size %u exceeds MAX %u. Dropping.\n", payload_size, MAX_DNS_PAYLOAD);
+        return XDP_PASS;
+    }
+    // ***** At this point, the verifier KNOWS payload_size <= MAX_DNS_PAYLOAD *****
+
+
+    // 11. Reserve MAX size in Ring Buffer
+    struct dns_event_meta *meta = bpf_ringbuf_reserve(&events, reserve_size, 0);
+    if (!meta) {
+        // Ring buffer full, increment drop count
+        __u64 *drop_count = bpf_map_lookup_elem(&drops, &zero);
+        if (drop_count) {
+             *drop_count += 1;
+        }
         return XDP_PASS;
     }
 
-    
-    // Update the actual size we managed to copy
-    event->payload_size = bytes_copied;
-    
-    // Submit the event to userspace
-    bpf_ringbuf_submit(event, 0);
-    
+    // 12. Populate Metadata (use the validated payload_size)
+    meta->src_port = 53;
+    meta->dest_port = dest_port_h;
+    meta->payload_size = payload_size; // Store the validated size
+
+    // 13. Copy ACTUAL Payload Data
+    // Destination: (void*)meta + sizeof(*meta)
+    // Source: payload_start
+    // Size: payload_size (Now guaranteed <= MAX_DNS_PAYLOAD)
+    int ret = bpf_probe_read_kernel((void*)meta + sizeof(*meta), payload_size, payload_start);
+    if (ret < 0) {
+        bpf_ringbuf_discard(meta, 0);
+        // bpf_printk("BPF: probe_read_kernel failed: %d\n", ret);
+        return XDP_PASS;
+    }
+
+    // 14. Submit
+    bpf_ringbuf_submit(meta, 0);
+
     return XDP_PASS;
 }
