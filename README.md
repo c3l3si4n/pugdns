@@ -82,7 +82,7 @@ Looking into the accuracy and number of responses that came back, we had the fol
 | `-verbose`    | bool   | false                       | Enable verbose logging output                                             | No       |
 | `-text`       | bool   | false                       | Use simple text output instead of the default interactive UI              | No       |
 | `-poll`       | int    | 1                           | AF_XDP poll timeout in milliseconds (for TX completion)                   | No       |
-| `-workers`    | int    | *# logical CPUs* | Number of workers for processing BPF responses                            | No       |
+| `-workers`    | int    | 1 | Number of workers for processing BPF responses                            | No       |
 | `-retries`    | int    | 3                           | Number of retries for domains that don't receive a response               | No       |
 
 **Example Usage:**
@@ -102,7 +102,7 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
     ```
 2.  **Install Dependencies:** Ensure you have Go (>= 1.18 recommended) and Clang/LLVM (for eBPF compilation) installed. You may also need kernel headers (`linux-headers-$(uname -r)` on Debian/Ubuntu).
     ```
-    apt install linux-headers-$(uname -r) llvm libbpf-dev; sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm;
+    sudo apt install linux-headers-$(uname -r) llvm libbpf-dev clang; sudo ln -s /usr/include/x86_64-linux-gnu/asm /usr/include/asm;
     ```
 3.  **Generate eBPF code and Build:**
     ```bash
