@@ -78,7 +78,6 @@ func ResolveMACAddresses(config *Config, link netlink.Link) (srcMAC, dstMAC net.
 	// Auto-resolve source MAC from interface if not provided
 	if config.SrcMAC == "" {
 		srcMAC = link.Attrs().HardwareAddr
-		fmt.Printf("Using interface MAC address: %s\n", srcMAC)
 	} else {
 		decoded, err := hex.DecodeString(config.SrcMAC)
 		if err != nil {

@@ -318,7 +318,6 @@ func packetSender(xsk *xdp.Socket, packetQueue <-chan PacketInfo, stopSignal <-c
 
 // statsCollector handles collecting and displaying transmission statistics
 func transmitPackets(xsk *xdp.Socket, initialDomains []string, config *Config) error {
-	log.Println("Initializing transmission manager...")
 	domainStates = make(map[string]*DomainStatus)
 	totalDomains := len(initialDomains)
 	neededNumberOfPackets = float64(totalDomains) // For progress bar based on domains
@@ -1050,22 +1049,17 @@ func main() {
 	}
 	defer xsk.Close() // Ensure socket is closed eventually
 
-	log.Println("Starting transmission process...")
 	// Call the refactored manager function
 	err = transmitPackets(xsk, domains, config)
 	if err != nil {
 		log.Fatalf("Transmission process failed: %v", err)
 	}
 
-	log.Println("Transmission process finished.")
 	// Final saving logic (can be refined)
 	log.Println("Saving results from cache to file:", config.OutputFile)
 	saveCachePrettified(config.OutputFile)
 
-	log.Println("Signaling BPF receiver to stop...")
 	close(stopper) // Signal BPF receiver via global stopper
 	<-bpfExited    // Wait for BPF receiver to fully exit
-
-	log.Println("Program finished.")
 
 }

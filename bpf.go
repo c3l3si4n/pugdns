@@ -52,7 +52,6 @@ type dnsEventMeta struct {
 var metaSize = int(unsafe.Sizeof(dnsEventMeta{}))
 
 func BpfReceiver(config *Config) {
-	log.Println("Starting BpfReceiver")
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
 	if err := rlimit.RemoveMemlock(); err != nil {
@@ -151,13 +150,11 @@ func BpfReceiver(config *Config) {
 	// Goroutine to close the ring buffer reader when stopper is signaled
 	go func() {
 		<-stopper
-		log.Println("Received stop signal, closing ring buffer reader...")
 		if err := rd.Close(); err != nil {
 			log.Fatalf("closing ringbuf reader: %s", err)
 		}
 	}()
 
-	log.Println("Waiting for BPF events..")
 	startedBPF <- true // Signal main thread that BPF is ready
 
 	numWorkers := config.NumWorkers
@@ -245,18 +242,15 @@ func BpfReceiver(config *Config) {
 					log.Printf("Worker %d: Processed response for %s (ID: %d, DestPort: %d)", workerID, fqdn, msg.Id, meta.DestPort)
 				}
 			}
-			log.Printf("Worker %d finished.", workerID)
 		}(i) // Pass worker ID
 	}
 
 	// Main event loop: Read from ring buffer and dispatch to workers
-	log.Println("BPF Receiver started, processing events...")
 	for {
 		record, err := rd.Read() // Blocking read
 		if err != nil {
 			// Check if the error is because the reader was closed
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("Ring buffer reader closed, exiting BPF receiver loop.")
 				break // Exit loop cleanly
 			}
 			// Log other unexpected errors
@@ -280,9 +274,6 @@ func BpfReceiver(config *Config) {
 	}
 
 	// Cleanup after the loop exits (due to rd.Close() via stopper)
-	log.Println("Closing BPF packet channel...")
 	close(packetChan) // Signal workers no more data is coming
-	log.Println("Waiting for BPF workers to finish...")
-	wg.Wait() // Wait for all workers to process remaining data and exit
-	log.Println("BPF Receiver finished.")
+	wg.Wait()         // Wait for all workers to process remaining data and exit
 }
