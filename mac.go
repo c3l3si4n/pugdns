@@ -99,7 +99,6 @@ func ResolveMACAddresses(config *Config, link netlink.Link) (srcMAC, dstMAC net.
 			dstMAC = net.HardwareAddr(broadcast)
 		} else {
 			dstMAC = resolvedMAC
-			fmt.Printf("Resolved destination MAC address: %s\n", dstMAC)
 		}
 	} else {
 		decoded, err := hex.DecodeString(config.DstMAC)

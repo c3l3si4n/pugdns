@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"sync"
@@ -472,7 +470,20 @@ loop:
 					} else {
 						pktInfo.Attempt = status.AttemptsMade + 1
 						// Non-blocking send to queue, might drop if full but unlikely
-						select {server
+						select {
+						case packetQueue <- pktInfo:
+							queuedRetries++
+							status.AttemptsMade++
+							status.LastAttempt = time.Now()
+							retryPendCount++ // It's now pending retry completion
+							if config.Verbose {
+								log.Printf("Retrying domain %s (Attempt %d)", fqdn, status.AttemptsMade)
+							}
+						default:
+							//log.Printf("Warning: Packet queue full when trying to retry %s", fqdn)
+							// Don't increment attempts if queue fails, it will retry check next tick
+						}
+					}
 				}
 				domainStatesMutex.Unlock() // Unlock after updating attempts
 				if config.Verbose && queuedRetries > 0 {
