@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"sync"
@@ -22,6 +24,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/miekg/dns"
+
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/exp/rand"
@@ -469,20 +472,7 @@ loop:
 					} else {
 						pktInfo.Attempt = status.AttemptsMade + 1
 						// Non-blocking send to queue, might drop if full but unlikely
-						select {
-						case packetQueue <- pktInfo:
-							queuedRetries++
-							status.AttemptsMade++
-							status.LastAttempt = time.Now()
-							retryPendCount++ // It's now pending retry completion
-							if config.Verbose {
-								log.Printf("Retrying domain %s (Attempt %d)", fqdn, status.AttemptsMade)
-							}
-						default:
-							//log.Printf("Warning: Packet queue full when trying to retry %s", fqdn)
-							// Don't increment attempts if queue fails, it will retry check next tick
-						}
-					}
+						select {server
 				}
 				domainStatesMutex.Unlock() // Unlock after updating attempts
 				if config.Verbose && queuedRetries > 0 {
@@ -857,10 +847,9 @@ func prettifyDnsMsg(msg *dns.Msg) *PrettyDnsMsg {
 			AuthenticatedData:  msg.AuthenticatedData,
 			CheckingDisabled:   msg.CheckingDisabled,
 		},
-		Question:   make([]PrettyDnsQuestion, len(msg.Question)),
-		Answers:    make([]PrettyDnsAnswer, len(msg.Answer)),
-		Authority:  make([]PrettyDnsAnswer, len(msg.Ns)),
-		Additional: make([]PrettyDnsAnswer, len(msg.Extra)),
+		Question:  make([]PrettyDnsQuestion, len(msg.Question)),
+		Answers:   make([]PrettyDnsAnswer, len(msg.Answer)),
+		Authority: make([]PrettyDnsAnswer, len(msg.Ns)),
 	}
 
 	if msg.Response {
@@ -905,16 +894,6 @@ func prettifyDnsMsg(msg *dns.Msg) *PrettyDnsMsg {
 	for i, rr := range msg.Ns {
 		pretty.Authority[i] = mapRR(rr)
 	}
-	for i, rr := range msg.Extra {
-		// Handle OPT Pseudo-RR type specifically if needed, otherwise map like others
-		if _, ok := rr.(*dns.OPT); ok {
-			// Decide how to represent OPT record, maybe skip or add specific fields
-			// For now, just skipping it in this example
-			pretty.Additional = pretty.Additional[:i] // Quick way to shrink if skipping
-			continue                                  // Skip OPT records in this simple example
-		}
-		pretty.Additional[i] = mapRR(rr)
-	}
 
 	return pretty
 }
@@ -936,7 +915,7 @@ func saveCachePrettified(filename string) { // Replace YourCacheType
 			}
 
 			// Use MarshalIndent for pretty printing
-			jsonData, err := json.MarshalIndent(prettyMsg, "", "  ") // Indent with 2 spaces
+			jsonData, err := json.Marshal(prettyMsg) // Indent with 2 spaces
 			if err != nil {
 				log.Printf("Error marshalling pretty result for %s: %v", domainKey, err)
 				return true // Continue ForEach
@@ -958,6 +937,7 @@ func saveCachePrettified(filename string) { // Replace YourCacheType
 }
 
 func main() {
+
 	// Initialize configuration
 	config := DefaultConfig()
 

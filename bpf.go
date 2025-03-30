@@ -232,6 +232,10 @@ func BpfReceiver(config *Config) {
 					continue
 				}
 
+				if msg.Rcode == dns.RcodeServerFailure || msg.Rcode == dns.RcodeRefused {
+					continue
+				}
+
 				// 7. Store in cache using FQDN from question
 				fqdn := msg.Question[0].Name // miekg/dns ensures this is FQDN
 				cache.Set(fqdn, msg)

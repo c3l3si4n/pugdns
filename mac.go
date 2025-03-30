@@ -36,8 +36,6 @@ func ResolveMAC(ip string, link netlink.Link) (net.HardwareAddr, error) {
 		return nil, fmt.Errorf("failed to discover gateway: %v", err)
 	}
 
-	fmt.Printf("Target IP %s is not in ARP table, using gateway %s\n", ip, gatewayIP)
-
 	// Look for the gateway MAC in the ARP table
 	for _, neigh := range neighbors {
 		if neigh.IP.Equal(gatewayIP) && len(neigh.HardwareAddr) != 0 {
@@ -58,7 +56,7 @@ func ResolveMAC(ip string, link netlink.Link) (net.HardwareAddr, error) {
 	}
 
 	// Wait a moment for ARP resolution
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	// Check ARP table again
 	neighbors, err = netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
