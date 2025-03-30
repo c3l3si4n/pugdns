@@ -713,13 +713,10 @@ func statsCollector(xsk *xdp.Socket, updateChan <-chan StatsUpdateData, stopStat
 			// Let's assume the manager sends everything in `updateData`.
 
 		case <-stopStats:
-			log.Println("Stats collector received stop signal.")
 			// Handle final UI update or text printing (maybe receive one last updateData?)
 			// ... (similar finalization logic as before) ...
 			if !config.TextOutput && p != nil {
 				// Optionally wait for a final update message or use last known state
-
-				time.Sleep(150 * time.Millisecond) // Give UI time
 				p.Quit()
 			} else if config.TextOutput {
 				fmt.Println("\n--- Final Stats ---") // Print final summary
@@ -727,7 +724,7 @@ func statsCollector(xsk *xdp.Socket, updateChan <-chan StatsUpdateData, stopStat
 
 			}
 			programDone <- struct{}{}
-			log.Println("Stats collector finished.")
+
 			return
 		}
 	}
