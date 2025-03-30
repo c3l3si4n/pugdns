@@ -11,9 +11,11 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/progress"
@@ -214,7 +216,6 @@ func packetSender(xsk *xdp.Socket, packetQueue <-chan PacketInfo, stopSignal <-c
 		case <-stopSignal:
 			log.Println("Packet sender received stop signal. Finalizing...")
 			finalizeTransmission(xsk)
-			log.Println("Packet sender finished.")
 			return
 		default:
 			// 1. Handle Completions first to free descriptors
@@ -317,7 +318,7 @@ func packetSender(xsk *xdp.Socket, packetQueue <-chan PacketInfo, stopSignal <-c
 }
 
 // statsCollector handles collecting and displaying transmission statistics
-func transmitPackets(xsk *xdp.Socket, initialDomains []string, config *Config) error {
+func transmitPackets(xsk *xdp.Socket, initialDomains []string, config *Config, shutdownChan <-chan struct{}) error {
 	domainStates = make(map[string]*DomainStatus)
 	totalDomains := len(initialDomains)
 	neededNumberOfPackets = float64(totalDomains) // For progress bar based on domains
@@ -333,7 +334,6 @@ func transmitPackets(xsk *xdp.Socket, initialDomains []string, config *Config) e
 		}
 	}
 
-	// --- Channels and Concurrency Setup ---
 	// --- Channels and Concurrency Setup ---
 	packetQueue := make(chan PacketInfo, 2048)
 	stopSender := make(chan struct{})
@@ -536,7 +536,13 @@ loop:
 		case <-timeout:
 			log.Println("Maximum runtime reached.")
 			break loop // Exit loop on global timeout
+
+		case <-shutdownChan:
+			log.Println("Shutdown signal received by manager. Stopping loop.")
+			break loop // Exit loop on external shutdown signal
+
 		}
+
 	}
 	// --- Shutdown ---
 	log.Println("Stopping packet sender...")
@@ -972,6 +978,16 @@ func main() {
 		log.Fatal("Error: interface (-interface) is required")
 	}
 
+	shutdownChan := make(chan struct{}) // Channel to signal shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Printf("Received signal: %v. Initiating shutdown...", <-sigChan)
+		close(shutdownChan)
+	}()
+
 	// Initialize the interface
 	link, err := netlink.LinkByName(config.NIC)
 	if err != nil {
@@ -1047,7 +1063,7 @@ func main() {
 	defer xsk.Close() // Ensure socket is closed eventually
 
 	// Call the refactored manager function
-	err = transmitPackets(xsk, domains, config)
+	err = transmitPackets(xsk, domains, config, shutdownChan)
 	if err != nil {
 		log.Fatalf("Transmission process failed: %v", err)
 	}
