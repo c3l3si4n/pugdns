@@ -111,10 +111,11 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
 
 ## Installing
 
-Download the pugdns from https://github.com/c3l3si4n/pugdns/releases/.
+If you don’t want to build pugdns from source and just want to test it out, simply download the pre-compiled binary from our [Releases page](https://github.com/c3l3si4n/pugdns/releases/). It will be easier and faster.
+
 
 ## Building from source
-
+If you really want to build from source, here's a rough guide on how to do so:
 
 1.  **Clone the repository:**
     ```bash
