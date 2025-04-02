@@ -109,7 +109,12 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
 ```
 *(Note: Running with `sudo` or appropriate capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`, potentially `CAP_SYS_ADMIN` for memlock/BPF) is typically required for AF_XDP and eBPF operations.)*
 
-## Installation
+## Installing
+
+Download the pugdns from https://github.com/c3l3si4n/pugdns/releases/.
+
+## Building from source
+
 
 1.  **Clone the repository:**
     ```bash
