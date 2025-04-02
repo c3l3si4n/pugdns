@@ -119,7 +119,7 @@ If you really want to build from source, here's a rough guide on how to do so:
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/c3l3si4n/pugdns](https://github.com/c3l3si4n/pugdns)
+    git clone https://github.com/c3l3si4n/pugdns
     cd pugdns
     ```
 2.  **Install Dependencies:** Ensure you have Go (>= 1.18 recommended) and Clang/LLVM (for eBPF compilation) installed. You may also need kernel headers (`linux-headers-$(uname -r)` on Debian/Ubuntu).
