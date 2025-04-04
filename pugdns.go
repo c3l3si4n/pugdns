@@ -993,6 +993,14 @@ func prettifyDnsMsg(msg *dns.Msg) *PrettyDnsMsg {
 	}
 	pretty.Answers = filteredAnswers
 
+	// Remove empty authority records
+	filteredAuthority := make([]PrettyDnsAnswer, 0, len(pretty.Authority))
+	for _, auth := range pretty.Authority {
+		if auth.Name != "" || auth.Type != "" || auth.Class != "" || auth.Data != "" {
+			filteredAuthority = append(filteredAuthority, auth)
+		}
+	}
+	pretty.Authority = filteredAuthority
 	return pretty
 }
 
