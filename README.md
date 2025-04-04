@@ -13,7 +13,7 @@ pugDNS will easily saturate your network link, so it's recommended to use this t
 
 pugDNS is designed to be as fast as possible. It uses AF_XDP sockets to directly inject DNS queries into the network driver (or kernel, depending on mode), bypassing much of the usual network stack. This allows it to send DNS queries and process responses with significantly better throughput and latency than traditional tools.
 
-The following benchmarks were performed on an AX41 Hetzner server (AMD Ryzen 5 3600) with a 1Gbit/s port. Benchmarking pugDNS against other popular DNS tools, we observed the following results using a ~20k domain list:
+The following benchmarks were performed on an AX42 Hetzner server (AMD Ryzen™ 7 PRO 8700GE) with a 1Gbit/s port. Benchmarking pugDNS against other popular DNS tools, we observed the following results using a ~20k domain list:
 
 *(Note: Benchmarks are indicative and can vary based on hardware, network conditions, and target nameservers. The original benchmarks were run on slightly different hardware but show the relative performance gains.)*
 
@@ -69,21 +69,37 @@ Looking into the accuracy and number of responses that came back, we had the fol
 
 ## Command-Line Flags
 
-| Flag          | Type   | Default                     | Description                                                               | Required |
-| :------------ | :----- | :-------------------------- | :------------------------------------------------------------------------ | :------- |
-| `-interface`  | string | ""                          | Network interface name to use (e.g., `eth0`, `enp6s0`)                    | **Yes** |
-| `-queue`      | int    | 0                           | Network interface queue ID to bind to                                     | No       |
-| `-srcMAC`     | string | ""                          | Source MAC address (Default: auto-detected from interface)                | No       |
-| `-dstMAC`     | string | ""                          | Destination MAC address (Gateway) (Default: auto-detected via ARP/NDP)    | No       |
-| `-srcIP`      | string | ""                          | Source IP address (Default: auto-detected from interface)                 | No       |
-| `-domains`    | string | ""                          | File containing domains to query (one per line)                           | **Yes**  |
-| `-nameservers`| string | ""                          | File containing nameserver IPs (one per line)                             | **Yes** |
-| `-output`     | string | "results.json"              | File to save results to (pretty JSON format)                              | No       |
-| `-verbose`    | bool   | false                       | Enable verbose logging output                                             | No       |
-| `-text`       | bool   | false                       | Use simple text output instead of the default interactive UI              | No       |
-| `-poll`       | int    | 1                           | AF_XDP poll timeout in milliseconds (for TX completion)                   | No       |
-| `-workers`    | int    | 1 | Number of workers for processing BPF responses                            | No       |
-| `-retries`    | int    | 3                           | Number of retries for domains that don't receive a response               | No       |
+```
+Usage of pugdns:
+  -domain string
+    	Single domain to query (when not using -domains file) (default "google.com")
+  -domains string
+    	File containing domains to query (one per line)
+  -dstmac string
+    	Destination MAC address (optional, uses ARP resolution if empty)
+  -interface string
+    	Network interface to attach to
+  -maxbatch int
+    	Maximum number of packets to send at once. Default is 128. I suggest not changing this. (default 128)
+  -nameservers string
+    	File containing nameservers to use (one per line)
+  -output string
+    	File to save results to (default "results.json")
+  -poll int
+    	Poll timeout in milliseconds (default 1)
+  -queue int
+    	The queue on the network interface to attach to
+  -retries int
+    	Number of retries for each domain (default 3)
+  -srcip string
+    	Source IP address (optional, uses interface IP if empty)
+  -srcmac string
+    	Source MAC address (optional, uses interface MAC if empty)
+  -verbose
+    	Enable verbose output
+  -workers int
+    	Number of workers to use (default 1)
+```
 
 **Example Usage:**
 
@@ -93,11 +109,17 @@ sudo ./pugdns -interface eth0 -domains domains.txt -nameservers resolvers.txt -o
 ```
 *(Note: Running with `sudo` or appropriate capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW`, potentially `CAP_SYS_ADMIN` for memlock/BPF) is typically required for AF_XDP and eBPF operations.)*
 
-## Installation
+## Installing
+
+If you don’t want to build pugdns from source and just want to test it out, simply download the pre-compiled binary from our [Releases page](https://github.com/c3l3si4n/pugdns/releases/). It will be easier and faster.
+
+
+## Building from source
+If you really want to build from source, here's a rough guide on how to do so:
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/c3l3si4n/pugdns](https://github.com/c3l3si4n/pugdns)
+    git clone https://github.com/c3l3si4n/pugdns
     cd pugdns
     ```
 2.  **Install Dependencies:** Ensure you have Go (>= 1.18 recommended) and Clang/LLVM (for eBPF compilation) installed. You may also need kernel headers (`linux-headers-$(uname -r)` on Debian/Ubuntu).
