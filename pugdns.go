@@ -983,6 +983,16 @@ func prettifyDnsMsg(msg *dns.Msg) *PrettyDnsMsg {
 		}
 	}
 
+	// Remove empty answers example: {"Name":"","Type":"","Class":"","TTL":0,"Data":""}
+	// Filter out empty answers
+	filteredAnswers := make([]PrettyDnsAnswer, 0, len(pretty.Answers))
+	for _, ans := range pretty.Answers {
+		if ans.Name != "" || ans.Type != "" || ans.Class != "" || ans.Data != "" {
+			filteredAnswers = append(filteredAnswers, ans)
+		}
+	}
+	pretty.Answers = filteredAnswers
+
 	return pretty
 }
 
