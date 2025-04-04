@@ -1,5 +1,9 @@
 package main
 
+import (
+	"time"
+)
+
 // Config holds all program configuration
 type Config struct {
 	NIC           string
@@ -13,9 +17,12 @@ type Config struct {
 	MaxBatchSize  int
 	Verbose       bool
 	TextOutput    bool
-	NumWorkers    int // Added for potential future use
-	PollTimeoutMs int // Added for poll timeout tuning
+	CodesToSkip   []int
+	NumWorkers    int
+	RetryTimeout  time.Duration
+	PollTimeoutMs int
 	Retries       int
+	RateLimitPPS  int // Added: Target packets per second for the sender
 }
 
 // DefaultConfig returns the default configuration
@@ -25,14 +32,17 @@ func DefaultConfig() *Config {
 		QueueID:       0,
 		SrcMAC:        "",
 		DstMAC:        "",
+		RetryTimeout:  5 * time.Second,
 		SrcIP:         "",
 		DomainName:    "google.com",
 		Nameservers:   []string{"8.8.8.8", "8.8.4.4"},
 		MaxBatchSize:  128,
 		TextOutput:    true,
 		OutputFile:    "results.json",
+		CodesToSkip:   []int{},
 		NumWorkers:    1,
-		PollTimeoutMs: 1, // Default to 1ms poll timeout
+		PollTimeoutMs: 1,
 		Retries:       3,
+		RateLimitPPS:  100000, // Default rate limit: 100k PPS
 	}
 }
