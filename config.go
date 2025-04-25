@@ -36,7 +36,7 @@ func DefaultConfig() *Config {
 		SrcIP:         "",
 		DomainName:    "google.com",
 		Nameservers:   []string{"8.8.8.8", "8.8.4.4"},
-		MaxBatchSize:  128,
+		MaxBatchSize:  400000,
 		TextOutput:    true,
 		OutputFile:    "results.json",
 		CodesToSkip:   []int{},
