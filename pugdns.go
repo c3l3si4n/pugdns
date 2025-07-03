@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/alphadose/haxmap"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/miekg/dns"
@@ -34,6 +37,7 @@ type PacketInfo struct {
 }
 
 type DomainStatus struct {
+	mu           sync.Mutex
 	AttemptsMade int
 	Responded    bool
 	LastAttempt  time.Time
@@ -51,6 +55,13 @@ type StatsUpdateData struct {
 	Duration            float64
 }
 
+// Performance-related globals
+var (
+	performanceTimings = make(map[string]*atomic.Uint64)
+	performanceCounts  = make(map[string]*atomic.Uint64)
+	performanceMutex   sync.Mutex
+)
+
 var receivedPackets uint64
 var statsPacketSentAttempted uint64
 var totalDomainsProcessed uint64
@@ -60,60 +71,90 @@ func readDomainsFromFile(filename string) ([]string, error) {
 		return nil, fmt.Errorf("filename cannot be empty")
 	}
 
-	items := []string{}
-	file, err := os.Open(filename)
+	// Read the entire file content into memory
+	contentBytes, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, fmt.Errorf("error opening file '%s': %w", filename, err)
+		return nil, fmt.Errorf("error reading file '%s': %w", filename, err)
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			items = append(items, line)
+	content := string(contentBytes)
+	lines := strings.Split(content, "\n")
+
+	// Pre-allocate slice with a reasonable capacity estimate if possible,
+	// although len(lines) might overestimate significantly due to comments/blanks.
+	// Starting with 0 capacity is safe and often performant enough.
+	items := make([]string, 0)
+
+	for _, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		// Skip empty lines and lines starting with #
+		if trimmedLine != "" {
+			items = append(items, trimmedLine)
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading file '%s': %w", filename, err)
-	}
 	if len(items) == 0 {
-		return nil, fmt.Errorf("no valid items found in file '%s'", filename)
+		// Check if the file was completely empty or only contained comments/whitespace
+		if len(contentBytes) == 0 {
+			return nil, fmt.Errorf("file '%s' is empty", filename)
+		}
+		return nil, fmt.Errorf("no valid, non-comment items found in file '%s'", filename)
 	}
 
 	return items, nil
 }
 
-func prepareSinglePacket(fqdn string, srcIP net.IP, srcMAC, dstMAC net.HardwareAddr, config *Config, rng *rand.Rand) (PacketInfo, error) {
-	if len(config.Nameservers) == 0 {
-		return PacketInfo{}, fmt.Errorf("no nameservers configured for %s", fqdn)
+func checksum(buf []byte) uint16 {
+	var sum uint32
+	for ; len(buf) >= 2; buf = buf[2:] {
+		sum += uint32(buf[0])<<8 | uint32(buf[1])
 	}
+	if len(buf) > 0 {
+		sum += uint32(buf[0]) << 8
+	}
+	for sum > 0xffff {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return ^uint16(sum)
+}
 
-	currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
-	dstIP := net.ParseIP(currentNameserver)
-	if dstIP == nil {
-		return PacketInfo{}, fmt.Errorf("invalid nameserver IP %s for %s", currentNameserver, fqdn)
-	}
-	dstIP = dstIP.To4()
-	if dstIP == nil {
-		return PacketInfo{}, fmt.Errorf("nameserver IP %s is not a valid IPv4 address for %s", currentNameserver, fqdn)
-	}
-
+func createPacketTemplate(srcIP net.IP, srcMAC, dstMAC net.HardwareAddr, config *Config) ([]byte, error) {
 	eth := &layers.Ethernet{
 		SrcMAC:       srcMAC,
 		DstMAC:       dstMAC,
 		EthernetType: layers.EthernetTypeIPv4,
 	}
 	ip := &layers.IPv4{
-		Version: 4, IHL: 5, TTL: 64, Id: uint16(rng.Intn(65535)), Protocol: layers.IPProtocolUDP,
-		SrcIP: srcIP, DstIP: dstIP, Flags: layers.IPv4DontFragment,
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    srcIP,
+		DstIP:    net.ParseIP("1.1.1.1"), // Placeholder, will be replaced
+		Flags:    layers.IPv4DontFragment,
 	}
-
-	srcPort := layers.UDPPort(1024 + rng.Intn(65535-1024))
-	udp := &layers.UDP{SrcPort: srcPort, DstPort: 53}
+	udp := &layers.UDP{
+		SrcPort: 0, // Placeholder
+		DstPort: 53,
+	}
 	udp.SetNetworkLayerForChecksum(ip)
 
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: false} // Checksums will be calculated manually
+	// Serialize with a dummy payload to get the correct header structure
+	err := gopacket.SerializeLayers(buf, opts, eth, ip, udp, gopacket.Payload([]byte{0}))
+	if err != nil {
+		return nil, fmt.Errorf("serializing template layers: %w", err)
+	}
+
+	// We only want the headers, not the dummy payload
+	return buf.Bytes()[:14+20+8], nil
+}
+
+func prepareSinglePacket(packetTemplate []byte, fqdn string, nameserverIP net.IP, rng *rand.Rand) ([]byte, error) {
+	defer timeOperation("PacketPrep")()
+
+	// 1. Create DNS query
 	query := new(dns.Msg)
 	query.Id = uint16(rng.Intn(65535))
 	query.RecursionDesired = true
@@ -123,24 +164,64 @@ func prepareSinglePacket(fqdn string, srcIP net.IP, srcMAC, dstMAC net.HardwareA
 		Qclass: dns.ClassINET,
 	}}
 	query.SetEdns0(4096, false)
-
 	dnsPayload, err := query.Pack()
 	if err != nil {
-		return PacketInfo{}, fmt.Errorf("packing DNS query for %s: %w", fqdn, err)
+		return nil, fmt.Errorf("packing DNS query for %s: %w", fqdn, err)
 	}
 
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	err = gopacket.SerializeLayers(buf, opts, eth, ip, udp, gopacket.Payload(dnsPayload))
-	if err != nil {
-		return PacketInfo{}, fmt.Errorf("serializing layers for %s: %w", fqdn, err)
-	}
+	// 2. Create the final packet from template and payload
+	packet := make([]byte, len(packetTemplate)+len(dnsPayload))
+	copy(packet, packetTemplate)
+	copy(packet[len(packetTemplate):], dnsPayload)
 
-	return PacketInfo{Domain: fqdn, PacketBytes: buf.Bytes()}, nil
+	// 3. Get header slices for mutation
+	ipHeader := packet[14:34]
+	udpHeader := packet[34:42]
+
+	// 4. Update lengths
+	ipTotalLen := uint16(20 + 8 + len(dnsPayload)) // IP header + UDP header + DNS
+	udpTotalLen := uint16(8 + len(dnsPayload))     // UDP header + DNS
+	binary.BigEndian.PutUint16(ipHeader[2:4], ipTotalLen)
+	binary.BigEndian.PutUint16(udpHeader[4:6], udpTotalLen)
+
+	// 5. Update dynamic fields
+	binary.BigEndian.PutUint16(ipHeader[4:6], uint16(rng.Intn(65535)))            // IP ID
+	copy(ipHeader[16:20], nameserverIP.To4())                                     // Dst IP
+	binary.BigEndian.PutUint16(udpHeader[0:2], uint16(1024+rng.Intn(65535-1024))) // Src Port
+
+	// 6. Calculate checksums
+	// Clear checksum fields first
+	ipHeader[10] = 0
+	ipHeader[11] = 0
+	udpHeader[6] = 0
+	udpHeader[7] = 0
+
+	// IP Checksum
+	ipCsum := checksum(ipHeader)
+	binary.BigEndian.PutUint16(ipHeader[10:12], ipCsum)
+
+	// UDP Checksum
+	pseudoHeader := make([]byte, 12)
+	copy(pseudoHeader[0:4], ipHeader[12:16]) // srcIP from template
+	copy(pseudoHeader[4:8], ipHeader[16:20]) // dstIP (just updated)
+	pseudoHeader[8] = 0                      // reserved
+	pseudoHeader[9] = 17                     // UDP protocol
+	binary.BigEndian.PutUint16(pseudoHeader[10:12], udpTotalLen)
+
+	udpCsumBuf := make([]byte, 0, len(pseudoHeader)+int(udpTotalLen))
+	udpCsumBuf = append(udpCsumBuf, pseudoHeader...)
+	udpCsumBuf = append(udpCsumBuf, packet[34:]...) // Append UDP header and payload
+
+	udpCsum := checksum(udpCsumBuf)
+	if udpCsum == 0 {
+		udpCsum = 0xffff // If checksum is 0, it should be sent as all 1s.
+	}
+	binary.BigEndian.PutUint16(udpHeader[6:8], udpCsum)
+
+	return packet, nil
 }
 
-func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan PacketInfo, wg *sync.WaitGroup, config *Config, domainStates map[string]*DomainStatus,
-	domainStatesMutex *sync.Mutex) {
+func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan PacketInfo, wg *sync.WaitGroup, config *Config, domainStates *haxmap.Map[string, *DomainStatus]) {
 	defer wg.Done()
 	log.Println("Packet sender started.")
 
@@ -166,13 +247,21 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			log.Println("Packet sender finished.")
 			return
 		default:
+		}
 
+		// Smart batching: determine batch size based on waiting packets and free slots.
+		packetsInQueue := len(packetQueue)
+		if packetsInQueue == 0 {
+			runtime.Gosched() // No work to do, yield.
+			continue
 		}
 
 		freeSlots := xsk.NumFreeTxSlots()
 		if freeSlots == 0 {
-
+			pollStart := time.Now()
 			_, _, pollErr = xsk.Poll(pollTimeout)
+			recordTiming("Sender_PollWait", time.Since(pollStart))
+
 			if pollErr != nil && pollErr != unix.ETIMEDOUT && pollErr != unix.EINTR {
 				log.Printf("Sender Poll(timeout) error: %v", pollErr)
 			}
@@ -187,7 +276,11 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			}
 		}
 
-		descsToRequest := freeSlots
+		// Request a number of descriptors matching the smaller of available packets or free slots.
+		descsToRequest := packetsInQueue
+		if descsToRequest > freeSlots {
+			descsToRequest = freeSlots
+		}
 		if descsToRequest > maxBatchSize {
 			descsToRequest = maxBatchSize
 		}
@@ -196,9 +289,11 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			continue
 		}
 
+		getDescsStart := time.Now()
 		descs := xsk.GetDescs(descsToRequest, false)
-		if len(descs) == 0 {
+		recordTiming("Sender_GetDescs", time.Since(getDescsStart))
 
+		if len(descs) == 0 {
 			runtime.Gosched()
 			continue
 		}
@@ -206,14 +301,13 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 		packetsToSend := make([]PacketInfo, 0, len(descs))
 		descsFilled := 0
 
+		fillLoopStart := time.Now()
 	fillLoop:
 		for i := 0; i < len(descs); i++ {
 			select {
 			case pktInfo, ok := <-packetQueue:
 				if !ok {
-
 					log.Println("Packet queue closed. Sender stopping fill loop.")
-
 					break fillLoop
 				}
 				if len(pktInfo.PacketBytes) == 0 {
@@ -224,7 +318,6 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 				frame := xsk.GetFrame(descs[descsFilled])
 				if len(frame) < len(pktInfo.PacketBytes) {
 					log.Printf("Error: Frame size (%d) too small for packet (%d bytes) for domain %s. Skipping.", len(frame), len(pktInfo.PacketBytes), pktInfo.Domain)
-
 					continue
 				}
 
@@ -235,37 +328,32 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 				descsFilled++
 
 			default:
-
 				break fillLoop
 			}
 		}
+		recordTiming("Sender_FillLoop", time.Since(fillLoopStart))
 
 		if descsFilled > 0 {
-
 			now := time.Now()
-			domainStatesMutex.Lock()
-			maxRetries := config.Retries + 1
 			for _, pktInfo := range packetsToSend {
-				if status, ok := domainStates[pktInfo.Domain]; ok {
-
-					if !status.Responded && status.AttemptsMade < maxRetries {
-
+				if status, ok := domainStates.Get(pktInfo.Domain); ok {
+					status.mu.Lock()
+					if !status.Responded {
 						status.LastAttempt = now
 					}
-				} else {
-
+					status.mu.Unlock()
 				}
 			}
-			domainStatesMutex.Unlock()
 
+			transmitStart := time.Now()
 			numSubmitted := xsk.Transmit(descs[:descsFilled])
+			recordTiming("Sender_Transmit", time.Since(transmitStart))
 			atomic.AddUint64(&statsPacketSentAttempted, uint64(descsFilled))
 
 			if numSubmitted < descsFilled {
 				log.Printf("Warning: Sender failed to submit %d packets (%d/%d). Manager will retry.", descsFilled-numSubmitted, numSubmitted, descsFilled)
 			}
 		} else {
-
 			runtime.Gosched()
 		}
 
@@ -326,7 +414,7 @@ func finalizeTransmission(xsk *xdp.Socket, config *Config) {
 func statsCollector(updateChan <-chan StatsUpdateData, stopStats <-chan struct{}, programDone chan<- struct{}, config *Config) {
 	log.Println("Statistics collector started.")
 	var lastUpdate StatsUpdateData
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	running := true
 
@@ -468,7 +556,7 @@ func generateFinalReport(failedDomainsList []string, totalDomainsInFile int, sta
 	fmt.Println("---------------------")
 }
 
-func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, domainStates map[string]*DomainStatus, domainStatesMutex *sync.Mutex, srcIP net.IP, srcMAC, dstMAC net.HardwareAddr, config *Config, rng *rand.Rand) int {
+func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, domainStates *haxmap.Map[string, *DomainStatus], packetTemplate []byte, config *Config, rng *rand.Rand) int {
 	if config.Verbose {
 		log.Printf("Feeding batch of %d domains...", len(domainsToFeed))
 	}
@@ -476,38 +564,37 @@ func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, d
 	now := time.Now()
 
 	for _, fqdn := range domainsToFeed {
+		if len(config.Nameservers) == 0 {
+			log.Printf("Error preparing packet for %s: No nameservers configured. Skipping this domain.", fqdn)
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			continue
+		}
+		currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
+		dstIP := net.ParseIP(currentNameserver)
+		if dstIP == nil {
+			log.Printf("Error preparing packet for %s: Invalid nameserver IP %s. Skipping this domain.", fqdn, currentNameserver)
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			continue
+		}
 
-		pktInfo, err := prepareSinglePacket(fqdn, srcIP, srcMAC, dstMAC, config, rng)
+		packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
 		if err != nil {
 			log.Printf("Error preparing initial packet for %s: %v. Skipping this domain.", fqdn, err)
 			atomic.AddUint64(&totalDomainsProcessed, 1)
 			continue
 		}
-		pktInfo.Attempt = 1
+		pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: 1}
 
-		select {
-		case packetQueue <- pktInfo:
+		// Set the new domain status. Haxmap handles concurrent writes.
+		// We only do this once per domain, so a simple Set is fine.
+		domainStates.Set(fqdn, &DomainStatus{
+			AttemptsMade: 1,
+			Responded:    false,
+			LastAttempt:  now,
+		})
+		addedAndQueued++
 
-			domainStatesMutex.Lock()
-
-			if _, exists := domainStates[fqdn]; !exists {
-				domainStates[fqdn] = &DomainStatus{
-					AttemptsMade: 1,
-					Responded:    false,
-					LastAttempt:  now,
-				}
-				addedAndQueued++
-			} else {
-
-				log.Printf("Warning: Domain %s already exists in state map during initial feed.", fqdn)
-			}
-			domainStatesMutex.Unlock()
-		default:
-			log.Printf("Warning: Packet queue full during initial feed for %s. Domain will not be processed.", fqdn)
-
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-
-		}
+		packetQueue <- pktInfo
 	}
 	if config.Verbose {
 		log.Printf("Fed batch complete. Added/Queued %d domains.", addedAndQueued)
@@ -515,21 +602,19 @@ func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, d
 	return addedAndQueued
 }
 
-func checkAndRetryDomains(domainStates map[string]*DomainStatus, domainStatesMutex *sync.Mutex, packetQueue chan<- PacketInfo, srcIP net.IP, srcMAC, dstMAC net.HardwareAddr, config *Config, rng *rand.Rand, failedDomainsList *[]string) (pendingCount int) {
-
+func checkAndRetryDomains(domainStates *haxmap.Map[string, *DomainStatus], packetQueue chan<- PacketInfo, packetTemplate []byte, config *Config, rng *rand.Rand, failedDomainsList *[]string) (pendingCount int) {
+	defer timeOperation("Manager_RetryCheck")()
 	now := time.Now()
-	domainsToRetry := []string{}
+	domainsToRetry := make(map[string]int) // map fqdn to current attempt count
 	domainsToRemove := []string{}
 	maxRetries := config.Retries + 1
+	var currentPending int
 
-	domainStatesMutex.Lock()
-	for fqdn, status := range domainStates {
+	domainStates.ForEach(func(fqdn string, status *DomainStatus) bool {
+		status.mu.Lock()
 
 		if !status.Responded {
 			if _, found := cache.Get(fqdn); found {
-				if config.Verbose {
-					log.Printf("Domain %s marked as responded based on cache check.", fqdn)
-				}
 				status.Responded = true
 			}
 		}
@@ -537,186 +622,149 @@ func checkAndRetryDomains(domainStates map[string]*DomainStatus, domainStatesMut
 		if status.Responded {
 			domainsToRemove = append(domainsToRemove, fqdn)
 			atomic.AddUint64(&totalDomainsProcessed, 1)
-			continue
 		} else if status.AttemptsMade >= maxRetries {
 			domainsToRemove = append(domainsToRemove, fqdn)
 			*failedDomainsList = append(*failedDomainsList, fqdn)
 			atomic.AddUint64(&totalDomainsProcessed, 1)
-			continue
-		}
-
-		if !status.LastAttempt.IsZero() && now.Sub(status.LastAttempt) > config.RetryTimeout {
-
-			domainsToRetry = append(domainsToRetry, fqdn)
-			if config.Verbose {
-
-			}
-		} else if !status.LastAttempt.IsZero() {
-
-			pendingCount++
+		} else if !status.LastAttempt.IsZero() && now.Sub(status.LastAttempt) > config.RetryTimeout {
+			domainsToRetry[fqdn] = status.AttemptsMade
 		} else {
-
-			log.Printf("Warning: Domain %s in unexpected state (pending, no LastAttempt). Adding to retry.", fqdn)
-			domainsToRetry = append(domainsToRetry, fqdn)
+			currentPending++
 		}
-	}
+
+		status.mu.Unlock()
+		return true // Continue iteration
+	})
 
 	for _, fqdn := range domainsToRemove {
-		delete(domainStates, fqdn)
+		domainStates.Del(fqdn)
 	}
-	domainStatesMutex.Unlock()
 
 	queuedCount := 0
 	failedToPrepareCount := 0
-	retryLaterCount := 0
 
 	if len(domainsToRetry) > 0 {
-		if config.Verbose {
-
-		}
-		for _, fqdn := range domainsToRetry {
-
-			var currentAttempt int
-			var exists bool
-			domainStatesMutex.Lock()
-			status, exists := domainStates[fqdn]
-
-			if !exists || status.Responded || status.AttemptsMade >= maxRetries {
-				domainStatesMutex.Unlock()
-
+		for fqdn, currentAttempt := range domainsToRetry {
+			currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
+			dstIP := net.ParseIP(currentNameserver)
+			if dstIP == nil {
+				log.Printf("Error preparing retry packet for %s: Invalid nameserver IP %s. Marking failed.", fqdn, currentNameserver)
+				failedToPrepareCount++
+				domainStates.Del(fqdn)
+				*failedDomainsList = append(*failedDomainsList, fqdn)
+				atomic.AddUint64(&totalDomainsProcessed, 1)
 				continue
 			}
-			currentAttempt = status.AttemptsMade
-			domainStatesMutex.Unlock()
-
-			pktInfo, err := prepareSinglePacket(fqdn, srcIP, srcMAC, dstMAC, config, rng)
+			packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
 			if err != nil {
 				log.Printf("Error preparing retry packet for %s (attempt %d): %v. Marking failed.", fqdn, currentAttempt+1, err)
 				failedToPrepareCount++
-
-				domainStatesMutex.Lock()
-				if status, ok := domainStates[fqdn]; ok {
-
-					if !status.Responded && status.AttemptsMade < maxRetries {
-						status.AttemptsMade = maxRetries
-						*failedDomainsList = append(*failedDomainsList, fqdn)
-						atomic.AddUint64(&totalDomainsProcessed, 1)
-						delete(domainStates, fqdn)
-					}
-				}
-				domainStatesMutex.Unlock()
+				domainStates.Del(fqdn)
+				*failedDomainsList = append(*failedDomainsList, fqdn)
+				atomic.AddUint64(&totalDomainsProcessed, 1)
 				continue
 			}
 
-			pktInfo.Attempt = currentAttempt + 1
+			pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: currentAttempt + 1}
+			packetQueue <- pktInfo
+			queuedCount++
 
-			select {
-			case packetQueue <- pktInfo:
-				queuedCount++
-
-				domainStatesMutex.Lock()
-
-				status, exists := domainStates[fqdn]
-				if exists && !status.Responded && status.AttemptsMade < maxRetries {
-
+			if status, ok := domainStates.Get(fqdn); ok {
+				status.mu.Lock()
+				if !status.Responded {
 					status.AttemptsMade++
 					status.LastAttempt = time.Now()
-				} else if exists {
-
 				}
-				domainStatesMutex.Unlock()
-			default:
-
-				retryLaterCount++
-				if config.Verbose {
-
-				}
-
+				status.mu.Unlock()
 			}
-		}
-		if config.Verbose && (queuedCount > 0 || failedToPrepareCount > 0 || retryLaterCount > 0) {
-
 		}
 	}
 
-	domainStatesMutex.Lock()
-	finalPendingCount := len(domainStates)
-	domainStatesMutex.Unlock()
-
-	return finalPendingCount
+	return int(domainStates.Len())
 }
 
 func transmitPackets(xsk *xdp.Socket, allInputDomains []string, config *Config, shutdownChan <-chan struct{}) error {
 
-	domainStates := make(map[string]*DomainStatus)
-	var domainStatesMutex sync.Mutex
+	domainStates := haxmap.New[string, *DomainStatus]()
 	var failedDomainsList []string
 
-	totalDomainsInFile := len(allInputDomains)
-	if totalDomainsInFile == 0 {
+	initialTotalDomains := len(allInputDomains)
+	if initialTotalDomains == 0 {
 		log.Println("No domains to process.")
 		return nil
 	}
-	log.Printf("Loaded %d domains for processing.", totalDomainsInFile)
+	log.Printf("Loaded %d domains. Starting asynchronous preparation...", initialTotalDomains)
 	atomic.StoreUint64(&totalDomainsProcessed, 0)
 
-	log.Println("Preparing and deduplicating FQDNs...")
-	numWorkers := runtime.NumCPU()
-	if numWorkers > len(allInputDomains)/1000 && len(allInputDomains) > 1000 {
-		numWorkers = len(allInputDomains) / 1000
-	}
-	if numWorkers == 0 {
-		numWorkers = 1
-	}
-	fqdnChan := make(chan string, len(allInputDomains))
-	var wg sync.WaitGroup
+	// --- Channels for async domain processing ---
+	processedDomainsChan := make(chan string, config.MaxBatchSize*4)
+	uniqueDomainCountChan := make(chan int, 1)
 
-	processChunk := func(chunk []string) {
-		defer wg.Done()
-		for _, domain := range chunk {
-			processedDomain := strings.TrimSpace(domain)
-			if processedDomain == "" {
+	// --- Start async domain processor ---
+	go func(domains []string) {
+		log.Println("Async domain processor started.")
+		// 1. Normalize and deduplicate
+		uniqueFqdns := make(map[string]struct{}, len(domains))
+
+		numWorkers := runtime.NumCPU()
+		if numWorkers > len(domains)/1000 && len(domains) > 1000 {
+			numWorkers = len(domains) / 1000
+		}
+		if numWorkers == 0 {
+			numWorkers = 1
+		}
+		fqdnChan := make(chan string, len(domains))
+		var wg sync.WaitGroup
+
+		processChunk := func(chunk []string) {
+			defer wg.Done()
+			for _, domain := range chunk {
+				processedDomain := strings.TrimSpace(domain)
+				if processedDomain == "" {
+					continue
+				}
+				if !strings.HasSuffix(processedDomain, ".") {
+					processedDomain += "."
+				}
+				fqdnChan <- processedDomain
+			}
+		}
+
+		chunkSize := (len(domains) + numWorkers - 1) / numWorkers
+		wg.Add(numWorkers)
+		for i := 0; i < numWorkers; i++ {
+			start := i * chunkSize
+			end := start + chunkSize
+			if end > len(domains) {
+				end = len(domains)
+			}
+			if start >= end {
+				wg.Done()
 				continue
 			}
-			if !strings.HasSuffix(processedDomain, ".") {
-				processedDomain += "."
-			}
-			fqdnChan <- processedDomain
+			go processChunk(domains[start:end])
 		}
-	}
 
-	chunkSize := (len(allInputDomains) + numWorkers - 1) / numWorkers
-	wg.Add(numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		start := i * chunkSize
-		end := start + chunkSize
-		if end > len(allInputDomains) {
-			end = len(allInputDomains)
+		go func() {
+			wg.Wait()
+			close(fqdnChan)
+		}()
+
+		for fqdn := range fqdnChan {
+			uniqueFqdns[fqdn] = struct{}{}
 		}
-		if start >= end {
-			wg.Done()
-			continue
+
+		log.Printf("Async preparation complete. Processing %d unique FQDN domains.", len(uniqueFqdns))
+		uniqueDomainCountChan <- len(uniqueFqdns)
+		close(uniqueDomainCountChan)
+
+		// 2. Stream unique domains to the manager
+		for fqdn := range uniqueFqdns {
+			processedDomainsChan <- fqdn
 		}
-		go processChunk(allInputDomains[start:end])
-	}
-
-	go func() {
-		wg.Wait()
-		close(fqdnChan)
-	}()
-
-	uniqueFqdns := make(map[string]struct{})
-	for fqdn := range fqdnChan {
-		uniqueFqdns[fqdn] = struct{}{}
-	}
-
-	fqdnDomains := make([]string, 0, len(uniqueFqdns))
-	for fqdn := range uniqueFqdns {
-		fqdnDomains = append(fqdnDomains, fqdn)
-	}
-
-	totalDomainsInFile = len(fqdnDomains)
-	log.Printf("Processing %d unique FQDN domains.", totalDomainsInFile)
+		close(processedDomainsChan)
+		log.Println("Async domain processor finished feeding all domains.")
+	}(allInputDomains)
 
 	initialQueueCapacity := config.MaxBatchSize * 4
 	if initialQueueCapacity < 2048 {
@@ -732,10 +780,20 @@ func transmitPackets(xsk *xdp.Socket, allInputDomains []string, config *Config, 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Start bottleneck reporter if in verbose mode
+	var reporterWg sync.WaitGroup
+	if config.Verbose {
+		reporterWg.Add(1)
+		go func() {
+			defer reporterWg.Done()
+			bottleneckReporter(ctx, config)
+		}()
+	}
+
 	go statsCollector(statsUpdateChan, stopStats, programDone, config)
 	senderWg.Add(1)
 
-	go packetSender(ctx, xsk, packetQueue, &senderWg, config, domainStates, &domainStatesMutex)
+	go packetSender(ctx, xsk, packetQueue, &senderWg, config, domainStates)
 
 	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
 	link, err := netlink.LinkByName(config.NIC)
@@ -751,75 +809,82 @@ func transmitPackets(xsk *xdp.Socket, allInputDomains []string, config *Config, 
 		log.Fatalf("Failed to parse source IP: %v", err)
 	}
 
-	startTime := time.Now()
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	var lastRawStats xdp.Stats
-	nextDomainIndex := 0
-	domainsCurrentlyManaged := 0
+	packetTemplate, err := createPacketTemplate(srcIP, srcMAC, dstMAC, config)
+	if err != nil {
+		log.Fatalf("Failed to create packet template: %v", err)
+	}
 
-	initialBatchSize := config.MaxBatchSize * 2
-	if initialBatchSize > len(fqdnDomains) {
-		initialBatchSize = len(fqdnDomains)
-	}
-	if initialBatchSize > 0 {
-		domainsToFeed := fqdnDomains[0:initialBatchSize]
-		added := feedDomainsToQueue(domainsToFeed, packetQueue, domainStates, &domainStatesMutex, srcIP, srcMAC, dstMAC, config, rng)
-		domainsCurrentlyManaged += added
-		nextDomainIndex = initialBatchSize
-	}
+	startTime := time.Now()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastRawStats xdp.Stats
+	domainsCurrentlyManaged := 0
+	totalDomainsForStats := initialTotalDomains
 
 loop:
 	for {
-
-		pendingCount := checkAndRetryDomains(domainStates, &domainStatesMutex, packetQueue, srcIP, srcMAC, dstMAC, config, rng, &failedDomainsList)
-		domainsCurrentlyManaged = pendingCount
-
-		feedThreshold := config.MaxBatchSize
-		if domainsCurrentlyManaged < feedThreshold && nextDomainIndex < totalDomainsInFile {
-			batchEndIndex := nextDomainIndex + config.MaxBatchSize*2
-			if batchEndIndex > totalDomainsInFile {
-				batchEndIndex = totalDomainsInFile
-			}
-			if nextDomainIndex < batchEndIndex {
-				domainsToFeed := fqdnDomains[nextDomainIndex:batchEndIndex]
-				added := feedDomainsToQueue(domainsToFeed, packetQueue, domainStates, &domainStatesMutex, srcIP, srcMAC, dstMAC, config, rng)
-				domainsCurrentlyManaged += added
-				nextDomainIndex = batchEndIndex
-			}
-		}
-
-		currentProcessed := atomic.LoadUint64(&totalDomainsProcessed)
-		lastRawStats = calculateAndSendStats(xsk, startTime, lastRawStats, totalDomainsInFile, domainsCurrentlyManaged, statsUpdateChan)
-
-		if int(currentProcessed) >= totalDomainsInFile && domainsCurrentlyManaged == 0 {
-
-			log.Printf("All %d domains processed and queue/retries are clear.", totalDomainsInFile)
-			break loop
-		}
-
 		select {
 		case <-shutdownChan:
 			log.Println("Shutdown signal received by manager. Stopping loop.")
 			break loop
-		case <-ticker.C:
-
-			if config.Verbose {
-
+		case count, ok := <-uniqueDomainCountChan:
+			if ok {
+				totalDomainsForStats = count
 			}
-			continue
-		default:
+			uniqueDomainCountChan = nil // Stop selecting on it so the case doesn't fire again
+		case <-ticker.C:
+			// The entire management logic now runs on a schedule instead of a busy-loop.
+			pendingCount := checkAndRetryDomains(domainStates, packetQueue, packetTemplate, config, rng, &failedDomainsList)
+			domainsCurrentlyManaged = pendingCount
 
-			runtime.Gosched()
+			// Feed new domains from the async processor
+			feedThreshold := config.MaxBatchSize
+			if domainsCurrentlyManaged < feedThreshold && processedDomainsChan != nil {
+				domainsToFeed := make([]string, 0, config.MaxBatchSize*2)
+			batchFillLoop:
+				for i := 0; i < config.MaxBatchSize*2; i++ {
+					select {
+					case fqdn, ok := <-processedDomainsChan:
+						if !ok {
+							processedDomainsChan = nil // sentinel for closed channel
+							break batchFillLoop
+						}
+						domainsToFeed = append(domainsToFeed, fqdn)
+					default:
+						// Channel is empty for now, stop trying to fill the batch
+						break batchFillLoop
+					}
+				}
+				if len(domainsToFeed) > 0 {
+					feedStart := time.Now()
+					added := feedDomainsToQueue(domainsToFeed, packetQueue, domainStates, packetTemplate, config, rng)
+					domainsCurrentlyManaged += added
+					recordTiming("Manager_FeedQueue", time.Since(feedStart))
+				}
+			}
+
+			statsStart := time.Now()
+			lastRawStats = calculateAndSendStats(xsk, startTime, lastRawStats, totalDomainsForStats, domainsCurrentlyManaged, statsUpdateChan)
+			recordTiming("Manager_CalculateStats", time.Since(statsStart))
+
+			// Exit condition: domain processor is done and no domains are left in-flight.
+			if processedDomainsChan == nil && domainsCurrentlyManaged == 0 {
+				log.Printf("All domains processed and queue/retries are clear.")
+				break loop
+			}
 		}
 	}
-
-	time.Sleep(2 * time.Second)
 
 	log.Println("Stopping packet sender via context cancellation...")
 	cancel()
 	senderWg.Wait()
 	log.Println("Packet sender stopped.")
+	if config.Verbose {
+		reporterWg.Wait()
+		log.Println("Bottleneck reporter stopped.")
+	}
 
 	log.Println("Closing packet queue...")
 	close(packetQueue)
@@ -829,7 +894,11 @@ loop:
 	<-programDone
 	log.Println("Statistics collector stopped.")
 
-	generateFinalReport(failedDomainsList, totalDomainsInFile, startTime, xsk, config)
+	if config.Verbose {
+		log.Println("--- Final Performance Analysis ---")
+		printPerformanceReport(config)
+	}
+	generateFinalReport(failedDomainsList, totalDomainsForStats, startTime, xsk, config)
 
 	return nil
 }
@@ -993,7 +1062,8 @@ func saveCachePrettified(config *Config) {
 	}
 	defer file.Close()
 
-	writer := bufio.NewWriter(file)
+	// Use a buffered writer for efficient I/O
+	writer := bufio.NewWriterSize(file, 65536) // Increased buffer size
 	defer writer.Flush()
 
 	skipCodes := make(map[int]struct{})
@@ -1001,36 +1071,94 @@ func saveCachePrettified(config *Config) {
 		skipCodes[code] = struct{}{}
 	}
 
-	savedCount := 0
-	skippedCount := 0
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	// Channels for distributing work and collecting results
+	jobs := make(chan *dns.Msg, numWorkers*2)
+	results := make(chan []byte, numWorkers*2)
+	var wgWorkers sync.WaitGroup
+	var wgWriter sync.WaitGroup
 
-	cache.ForEach(func(domainKey string, responseMsg *dns.Msg) bool {
-		if responseMsg != nil {
-			if _, skip := skipCodes[responseMsg.Rcode]; !skip {
-				prettyMsg := prettifyDnsMsg(responseMsg)
-				jsonData, err := json.Marshal(prettyMsg)
-				if err != nil {
-					log.Printf("Error marshalling JSON for domain %s: %v", domainKey, err)
-					return true
-				}
-				_, err = writer.Write(jsonData)
-				if err == nil {
-					_, err = writer.WriteString("\n")
-				}
-				if err != nil {
-					log.Printf("Error writing to output file for domain %s: %v", domainKey, err)
+	var savedCount, skippedCount atomic.Int64 // Use atomic for concurrent updates
 
-					return true
+	// Start worker goroutines
+	wgWorkers.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			defer wgWorkers.Done()
+			for msg := range jobs {
+				if _, skip := skipCodes[msg.Rcode]; !skip {
+					prettyMsg := prettifyDnsMsg(msg)
+					jsonData, err := json.Marshal(prettyMsg)
+					if err != nil {
+						// Log marshalling errors but continue processing other messages
+						// Find the domain name from the question section for logging
+						domainName := "unknown"
+						if len(msg.Question) > 0 {
+							domainName = msg.Question[0].Name
+						}
+						log.Printf("Error marshalling JSON for domain %s: %v", domainName, err)
+						continue // Skip sending this result
+					}
+					results <- jsonData // Send marshalled JSON to the writer channel
+					savedCount.Add(1)
+				} else {
+					skippedCount.Add(1)
 				}
-				savedCount++
-			} else {
-				skippedCount++
+			}
+		}()
+	}
+
+	// Start the writer goroutine
+	wgWriter.Add(1)
+	go func() {
+		defer wgWriter.Done()
+		for jsonData := range results {
+			_, err := writer.Write(jsonData)
+			if err == nil {
+				_, err = writer.WriteString("\n")
+			}
+			if err != nil {
+				// Log write errors; potentially stop processing if disk is full, etc.
+				// For now, just log the error and continue.
+				log.Printf("Error writing to output file: %v", err)
+				// Consider adding logic here to handle persistent write errors,
+				// maybe by cancelling the context or signalling other goroutines.
 			}
 		}
-		return true
+	}()
+
+	// Feed the jobs channel from the cache
+	// Note: cache.ForEach might block if the jobs channel is full.
+	// The iteration itself is sequential, but processing happens in parallel.
+	cache.ForEach(func(domainKey string, responseMsg *dns.Msg) bool {
+		if responseMsg != nil {
+			jobs <- responseMsg // Send message to workers
+		}
+		return true // Continue iteration
 	})
 
-	log.Printf("Finished saving cache. Saved %d responses, skipped %d based on RCODE.", savedCount, skippedCount)
+	// Close the jobs channel once all items from the cache are sent
+	close(jobs)
+
+	// Wait for all worker goroutines to finish
+	wgWorkers.Wait()
+
+	// Close the results channel once all workers are done
+	close(results)
+
+	// Wait for the writer goroutine to finish writing all results
+	wgWriter.Wait()
+
+	// Ensure the buffer is flushed before returning
+	err = writer.Flush()
+	if err != nil {
+		log.Printf("Error flushing writer for output file '%s': %v", config.OutputFile, err)
+	}
+
+	log.Printf("Finished saving cache. Saved %d responses, skipped %d based on RCODE.", savedCount.Load(), skippedCount.Load())
 }
 
 func main() {
@@ -1175,4 +1303,106 @@ func main() {
 	}
 
 	log.Println("PugDNS finished.")
+}
+
+// --- Performance Analysis Utilities ---
+
+func recordTiming(name string, d time.Duration) {
+	performanceMutex.Lock()
+	total, ok := performanceTimings[name]
+	if !ok {
+		total = &atomic.Uint64{}
+		performanceTimings[name] = total
+	}
+	count, ok := performanceCounts[name]
+	if !ok {
+		count = &atomic.Uint64{}
+		performanceCounts[name] = count
+	}
+	performanceMutex.Unlock()
+
+	total.Add(uint64(d.Nanoseconds()))
+	count.Add(1)
+}
+
+func timeOperation(name string) func() {
+	start := time.Now()
+	return func() {
+		recordTiming(name, time.Since(start))
+	}
+}
+
+type performanceStat struct {
+	Name       string
+	TotalTime  time.Duration
+	Count      uint64
+	AvgTime    time.Duration
+	Percentage float64
+}
+
+func printPerformanceReport(config *Config) {
+	performanceMutex.Lock()
+	timingsSnapshot := make(map[string]uint64)
+	countsSnapshot := make(map[string]uint64)
+	var totalTimeNs uint64
+
+	for name, val := range performanceTimings {
+		ns := val.Load()
+		timingsSnapshot[name] = ns
+		totalTimeNs += ns
+	}
+	for name, val := range performanceCounts {
+		countsSnapshot[name] = val.Load()
+	}
+	performanceMutex.Unlock()
+
+	if totalTimeNs == 0 {
+		return
+	}
+
+	statsList := make([]performanceStat, 0, len(timingsSnapshot))
+	for name, ns := range timingsSnapshot {
+		count := countsSnapshot[name]
+		if count == 0 {
+			continue
+		}
+		statsList = append(statsList, performanceStat{
+			Name:       name,
+			TotalTime:  time.Duration(ns),
+			Count:      count,
+			AvgTime:    time.Duration(ns / count),
+			Percentage: (float64(ns) / float64(totalTimeNs)) * 100,
+		})
+	}
+
+	sort.Slice(statsList, func(i, j int) bool {
+		return statsList[i].Percentage > statsList[j].Percentage
+	})
+
+	var report strings.Builder
+	report.WriteString("\n")
+	for _, stat := range statsList {
+		report.WriteString(fmt.Sprintf("%-20s: %6.2f%% | Avg: %-15s | Calls: %d\n",
+			stat.Name, stat.Percentage, stat.AvgTime, stat.Count))
+	}
+	log.Print(report.String())
+}
+
+func bottleneckReporter(ctx context.Context, config *Config) {
+	if !config.Verbose {
+		return
+	}
+	log.Println("Bottleneck reporter started.")
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			log.Println("--- Performance Analysis Tick ---")
+			printPerformanceReport(config)
+		}
+	}
 }
