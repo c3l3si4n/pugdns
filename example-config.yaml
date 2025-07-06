@@ -1,0 +1,23 @@
+interface: ""
+queue_id: 0
+src_mac: ""
+dst_mac: ""
+src_ip: ""
+nameservers:
+    - 8.8.8.8
+    - 8.8.4.4
+    - 1.1.1.1
+    - 1.0.0.1
+domain: ""
+retry_timeout: 2s
+retries: 10
+max_batch_size: 65536
+poll_timeout_ms: 1
+output_file: results.jsonl
+skip_codes:
+    - 2
+    - 5
+verbose: false
+stats_interval: ""
+quiet: false
+dry_run: false

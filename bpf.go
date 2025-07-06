@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"log"
@@ -9,23 +8,25 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe" // Needed for size calculation
 
-	"github.com/alphadose/haxmap"
 	"github.com/cilium/ebpf" // Need this for map iteration
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/miekg/dns"
 )
 
 // --- CACHE, STOPPER, STARTEDBPF remain the same ---
 var (
-	cache      = haxmap.New[string, *dns.Msg]()
+	// The cache is sharded to reduce lock contention from concurrent workers.
+	// It is initialized in the main() function in pugdns.go.
+	cache *ShardedHaxMap
+
 	stopper    = make(chan os.Signal, 1)
 	startedBPF = make(chan bool, 1)
 	// Separate counters for different drop reasons
@@ -33,6 +34,12 @@ var (
 	bpfDropCount       uint64 // Kernel BPF drops (ringbuf full)
 	dropMutex          sync.RWMutex
 )
+
+// cacheWriteRequest is used to send data to the dedicated cache writer goroutine.
+type cacheWriteRequest struct {
+	fqdn    string
+	payload []byte
+}
 
 // --- Definition matching the C struct ---
 //
@@ -50,6 +57,54 @@ type dnsEventMeta struct {
 
 // Calculate size of the metadata struct dynamically
 var metaSize = int(unsafe.Sizeof(dnsEventMeta{}))
+
+// getFqdnFromDnsQuery manually parses the question section of a raw DNS payload
+// to extract the FQDN. It's much faster than a full dns.Msg.Unpack().
+func getFqdnFromDnsQuery(payload []byte) (string, bool) {
+	// DNS header is 12 bytes. Question starts at byte 12.
+	if len(payload) <= 12 {
+		return "", false
+	}
+
+	var fqdn strings.Builder
+	offset := 12
+
+	for {
+		if offset >= len(payload) {
+			return "", false // Malformed, went past end of payload
+		}
+
+		labelLen := int(payload[offset])
+		if labelLen == 0 {
+			break // End of domain name
+		}
+
+		// Check for DNS compression pointers.
+		if (labelLen & 0xC0) == 0xC0 {
+			// Pointer detected. For simplicity in this hot path, we don't follow them.
+			// The question in a response almost always matches the original question format
+			// without compression. We just stop here.
+			break
+		}
+
+		offset++ // move past length byte
+
+		if offset+labelLen > len(payload) {
+			return "", false // Malformed, label overflows payload
+		}
+
+		fqdn.Write(payload[offset : offset+labelLen])
+		fqdn.WriteByte('.')
+
+		offset += labelLen
+	}
+
+	if fqdn.Len() == 0 {
+		return "", false // No name found
+	}
+
+	return fqdn.String(), true
+}
 
 func BpfReceiver(config *Config) {
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
@@ -157,123 +212,50 @@ func BpfReceiver(config *Config) {
 
 	startedBPF <- true // Signal main thread that BPF is ready
 
-	numWorkers := config.NumWorkers
-	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
-	}
-	// Channel still holds raw bytes from ring buffer samples
-	packetChan := make(chan []byte, numWorkers*1024*1024*8) // Keep reasonable buffer
-
-	var wg sync.WaitGroup
-	wg.Add(numWorkers)
-
-	// Start worker goroutines
-	for i := 0; i < numWorkers; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			var meta dnsEventMeta // Reusable metadata struct per worker
-
-			for rawSample := range packetChan { // Receive raw byte slice
-
-				// 1. Validate minimum size for metadata
-				if len(rawSample) < metaSize {
-					// if config.Verbose { // Avoid log spam
-					// 	log.Printf("Worker %d: Received short sample (%d bytes) < metaSize (%d)", workerID, len(rawSample), metaSize)
-					// }
-					continue
-				}
-
-				// 2. Read metadata from the beginning of the sample
-				// Use a bytes.Reader for convenient reading
-				reader := bytes.NewReader(rawSample)
-				if err := binary.Read(reader, binary.LittleEndian, &meta); err != nil {
-					log.Printf("Worker %d: Failed reading metadata: %s", workerID, err)
-					continue
-				}
-
-				// 3. Validate declared payload size
-				if meta.PayloadSize == 0 {
-					// if config.Verbose {
-					// 	log.Printf("Worker %d: Received sample with zero payload size from DestPort %d.", workerID, meta.DestPort)
-					// }
-					continue
-				}
-				// Check if declared size fits within the *remaining* buffer
-				// reader.Len() now gives the number of bytes *after* reading meta
-				if int(meta.PayloadSize) > reader.Len() {
-					log.Printf("Worker %d: Declared payload size (%d) > remaining sample size (%d) for DestPort %d.", workerID, meta.PayloadSize, reader.Len(), meta.DestPort)
-					continue
-				}
-
-				// 4. Extract the payload slice (no copy needed)
-				// It starts right after the metadata in the original slice
-				dnsPayload := rawSample[metaSize : metaSize+int(meta.PayloadSize)]
-
-				// 5. Unpack the DNS message
-				msg := new(dns.Msg)
-				err := msg.Unpack(dnsPayload)
-				if err != nil {
-					// DNS unpacking errors can be common (malformed responses, etc.)
-					// Log less verbosely unless debugging
-					// if config.Verbose {
-					// 	log.Printf("Worker %d: Failed unpacking DNS payload (%d bytes) for DestPort %d: %s", workerID, len(dnsPayload), meta.DestPort, err)
-					// }
-					continue
-				}
-
-				// 6. Check for Question section (needed for cache key)
-				if len(msg.Question) == 0 {
-					// if config.Verbose {
-					// 	log.Printf("Worker %d: Received DNS msg with no questions for DestPort %d.", workerID, meta.DestPort)
-					// }
-					continue
-				}
-
-				if msg.Rcode == dns.RcodeServerFailure || msg.Rcode == dns.RcodeRefused {
-					continue
-				}
-
-				// 7. Store in cache using FQDN from question
-				fqdn := msg.Question[0].Name // miekg/dns ensures this is FQDN
-				cache.Set(fqdn, msg)
-				atomic.AddUint64(&receivedPackets, 1) // Increment total SUCCESSFUL processing count
-
-				if config.Verbose {
-					log.Printf("Worker %d: Processed response for %s (ID: %d, DestPort: %d)", workerID, fqdn, msg.Id, meta.DestPort)
-				}
-			}
-		}(i) // Pass worker ID
-	}
-
-	// Main event loop: Read from ring buffer and dispatch to workers
+	// A single, tight loop for processing packets synchronously.
+	// This avoids channel and goroutine overhead, which was the bottleneck.
 	for {
 		record, err := rd.Read() // Blocking read
 		if err != nil {
-			// Check if the error is because the reader was closed
 			if errors.Is(err, ringbuf.ErrClosed) {
 				break // Exit loop cleanly
 			}
-			// Log other unexpected errors
 			log.Printf("Error reading from ring buffer: %s", err)
 			continue
 		}
 
-		// Send the raw sample bytes to the worker channel (non-blocking)
-		select {
-		case packetChan <- record.RawSample:
-			// Sent successfully to a worker
-		default:
-			// If the channel is full, workers are falling behind
-			atomic.AddUint64(&userspaceDropCount, 1)
-			// Log this periodically to avoid spamming logs
-			if userspaceDropCount%1000 == 1 { // Log every 1000 user-space drops
+		// The record's memory is only valid until the next Read() call.
+		// We process it immediately and make a right-sized copy for the cache.
+		rawSample := record.RawSample
 
-				log.Printf("Warning: BPF worker channel full. Dropping packet. (User-space drops: %d)", userspaceDropCount)
-			}
+		if len(rawSample) < metaSize {
+			continue
 		}
-	}
 
-	// Cleanup after the loop exits (due to rd.Close() via stopper)
-	close(packetChan) // Signal workers no more data is coming
-	wg.Wait()         // Wait for all workers to process remaining data and exit
+		// Manually decode metadata
+		metaPayloadSize := binary.LittleEndian.Uint16(rawSample[4:6])
+
+		if metaPayloadSize == 0 {
+			continue
+		}
+		if int(metaPayloadSize) > len(rawSample)-metaSize {
+			continue
+		}
+
+		dnsPayload := rawSample[metaSize : metaSize+int(metaPayloadSize)]
+
+		fqdn, ok := getFqdnFromDnsQuery(dnsPayload)
+		if !ok {
+			continue
+		}
+
+		// This is the single, essential copy to prevent the ring buffer's
+		// memory from being held in our cache.
+		payloadToCache := make([]byte, len(dnsPayload))
+		copy(payloadToCache, dnsPayload)
+
+		cache.Set(fqdn, payloadToCache)
+		atomic.AddUint64(&receivedPackets, 1)
+
+	}
 }

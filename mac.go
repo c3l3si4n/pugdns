@@ -10,6 +10,46 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// findDefaultInterface discovers the default network interface for internet-bound traffic.
+func findDefaultInterface() (string, error) {
+	gatewayIP, err := gateway.DiscoverGateway()
+	if err != nil {
+		return "", fmt.Errorf("could not discover gateway: %w", err)
+	}
+
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return "", fmt.Errorf("could not list interfaces: %w", err)
+	}
+
+	for _, iface := range interfaces {
+		// Skip loopback, non-running, and virtual interfaces
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			// We only care about IPv4 for this logic and ignore invalid CIDRs
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+
+			// Check if the interface's subnet contains the gateway IP
+			if ipNet.Contains(gatewayIP) {
+				return iface.Name, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no interface found for gateway %s", gatewayIP)
+}
+
 // ResolveMAC resolves the MAC address for a given IP using the ARP table and gateway if needed
 func ResolveMAC(ip string, link netlink.Link) (net.HardwareAddr, error) {
 	// If IP is localhost, return the link's MAC address

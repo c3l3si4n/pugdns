@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -24,10 +28,19 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/miekg/dns"
 
+	"io"
+
 	"github.com/slavc/xdp"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/exp/rand"
 	"golang.org/x/sys/unix"
+)
+
+// Version information
+var (
+	Version   = "dev"
+	BuildTime = "unknown"
+	GitCommit = "unknown"
 )
 
 type PacketInfo struct {
@@ -44,15 +57,16 @@ type DomainStatus struct {
 }
 
 type StatsUpdateData struct {
-	TotalDomains        int
-	RespondedDomains    int
-	RetryingDomains     int
-	FailedDomains       int
-	ReceivedPackets     uint64
-	PacketsSentRaw      uint64
-	PacketsPerSecRaw    uint64
-	AvgPacketsPerSecRaw float64
-	Duration            float64
+	TotalDomains             int
+	RespondedDomains         int
+	RetryingDomains          int
+	FailedDomains            int
+	ReceivedPackets          uint64
+	PacketsSentRaw           uint64
+	PacketsPerSecRaw         uint64
+	AvgPacketsPerSecRaw      float64
+	SmoothedPacketsPerSecRaw float64
+	Duration                 float64
 }
 
 // Performance-related globals
@@ -62,9 +76,83 @@ var (
 	performanceMutex   sync.Mutex
 )
 
+// ShardedHaxMap provides a sharded cache to reduce lock contention.
+type ShardedHaxMap struct {
+	shards    []*haxmap.Map[string, []byte]
+	numShards uint32
+}
+
+// NewShardedHaxMap creates and initializes a new sharded map.
+func NewShardedHaxMap(numShards uint32) *ShardedHaxMap {
+	if numShards == 0 {
+		numShards = 1
+	}
+	shm := &ShardedHaxMap{
+		shards:    make([]*haxmap.Map[string, []byte], numShards),
+		numShards: numShards,
+	}
+	for i := uint32(0); i < numShards; i++ {
+		shm.shards[i] = haxmap.New[string, []byte]()
+	}
+	return shm
+}
+
+func (shm *ShardedHaxMap) getShardIndex(key string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return h.Sum32() % shm.numShards
+}
+
+// Set adds a key-value pair to the appropriate shard.
+func (shm *ShardedHaxMap) Set(key string, value []byte) {
+	shardIndex := shm.getShardIndex(key)
+	shm.shards[shardIndex].Set(key, value)
+}
+
+// Get retrieves a value from the appropriate shard.
+func (shm *ShardedHaxMap) Get(key string) ([]byte, bool) {
+	shardIndex := shm.getShardIndex(key)
+	return shm.shards[shardIndex].Get(key)
+}
+
+// Del removes a key from the appropriate shard.
+func (shm *ShardedHaxMap) Del(key string) {
+	shardIndex := shm.getShardIndex(key)
+	shm.shards[shardIndex].Del(key)
+}
+
+// ForEach iterates over all key-value pairs in all shards.
+func (shm *ShardedHaxMap) ForEach(f func(string, []byte) bool) {
+	for _, shard := range shm.shards {
+		cont := true
+		shard.ForEach(func(key string, val []byte) bool {
+			cont = f(key, val)
+			return cont
+		})
+		if !cont {
+			break
+		}
+	}
+}
+
+// Len returns the total number of items across all shards.
+func (shm *ShardedHaxMap) Len() int {
+	var total int
+	for _, shard := range shm.shards {
+		total += int(shard.Len())
+	}
+	return total
+}
+
 var receivedPackets uint64
-var statsPacketSentAttempted uint64
 var totalDomainsProcessed uint64
+var totalUniqueDomains uint64
+var respondedDomainsCount uint64
+
+// Add new metrics for retry tracking
+var domainsRequiringRetries uint64
+var totalRetryAttempts uint64
+var firstAttemptSuccesses uint64
 
 func readDomainsFromFile(filename string) ([]string, error) {
 	if filename == "" {
@@ -102,6 +190,71 @@ func readDomainsFromFile(filename string) ([]string, error) {
 	}
 
 	return items, nil
+}
+
+func streamDomainsFromFile(filename string, domainChan chan<- string) {
+	defer close(domainChan)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		appLogger.Fatal("Error opening domain file '%s' for streaming: %v", filename, err)
+		return
+	}
+	defer file.Close()
+
+	const maxChunkSize = 4 * 1024 * 1024 // 4MB chunks
+	reader := bufio.NewReaderSize(file, maxChunkSize)
+	var remainder []byte
+
+	for {
+		chunk := make([]byte, maxChunkSize)
+		bytesRead, readErr := reader.Read(chunk)
+
+		if bytesRead > 0 {
+			// Prepend remainder from the previous chunk to form the current working data.
+			currentData := append(remainder, chunk[:bytesRead]...)
+			lastNewline := bytes.LastIndexByte(currentData, '\n')
+
+			if lastNewline != -1 {
+				// Process all complete lines found in the current data.
+				lines := bytes.Split(currentData[:lastNewline], []byte{'\n'})
+				for _, line := range lines {
+					trimmed := bytes.TrimSpace(line)
+					if len(trimmed) > 0 {
+						domainChan <- string(trimmed)
+					}
+				}
+				// Save the potentially incomplete line after the last newline for the next iteration.
+				// A copy is made to prevent aliasing the chunk buffer.
+				newRemainder := make([]byte, len(currentData)-lastNewline-1)
+				copy(newRemainder, currentData[lastNewline+1:])
+				remainder = newRemainder
+			} else {
+				// No newline was found in the entire chunk, so the whole thing is a remainder.
+				// A copy is made to prevent aliasing the chunk buffer.
+				newRemainder := make([]byte, len(currentData))
+				copy(newRemainder, currentData)
+				remainder = newRemainder
+			}
+		}
+
+		if readErr == io.EOF {
+			// The file has been fully read. Process the final remainder, which contains
+			// the last line if the file didn't end with a newline.
+			if len(remainder) > 0 {
+				trimmed := bytes.TrimSpace(remainder)
+				if len(trimmed) > 0 {
+					domainChan <- string(trimmed)
+				}
+			}
+			break // Exit the loop
+		}
+
+		if readErr != nil {
+			appLogger.Warn("Error reading chunk from domain file: %v", readErr)
+			break // Exit on other errors
+		}
+	}
 }
 
 func checksum(buf []byte) uint16 {
@@ -169,8 +322,10 @@ func prepareSinglePacket(packetTemplate []byte, fqdn string, nameserverIP net.IP
 		return nil, fmt.Errorf("packing DNS query for %s: %w", fqdn, err)
 	}
 
-	// 2. Create the final packet from template and payload
+	// 2. Create the final packet from template and payload.
+	// Simple allocation is cleaner and avoids the complexity and bugs of sync.Pool.
 	packet := make([]byte, len(packetTemplate)+len(dnsPayload))
+
 	copy(packet, packetTemplate)
 	copy(packet[len(packetTemplate):], dnsPayload)
 
@@ -223,7 +378,7 @@ func prepareSinglePacket(packetTemplate []byte, fqdn string, nameserverIP net.IP
 
 func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan PacketInfo, wg *sync.WaitGroup, config *Config, domainStates *haxmap.Map[string, *DomainStatus]) {
 	defer wg.Done()
-	log.Println("Packet sender started.")
+	appLogger.Info("Packet sender started.")
 
 	maxBatchSize := config.MaxBatchSize
 	pollTimeout := config.PollTimeoutMs
@@ -232,7 +387,7 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 
 		_, _, pollErr := xsk.Poll(0)
 		if pollErr != nil && pollErr != unix.ETIMEDOUT && pollErr != unix.EINTR && pollErr != unix.EAGAIN {
-			log.Printf("Sender Poll error: %v", pollErr)
+			appLogger.Warn("Sender Poll error: %v", pollErr)
 		} else {
 			numCompleted := xsk.NumCompleted()
 			if numCompleted > 0 {
@@ -242,9 +397,9 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 
 		select {
 		case <-ctx.Done():
-			log.Println("Packet sender received stop signal via context. Finalizing...")
+			appLogger.Info("Packet sender received stop signal. Finalizing...")
 			finalizeTransmission(xsk, config)
-			log.Println("Packet sender finished.")
+			appLogger.Success("Packet sender finished.")
 			return
 		default:
 		}
@@ -263,7 +418,7 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			recordTiming("Sender_PollWait", time.Since(pollStart))
 
 			if pollErr != nil && pollErr != unix.ETIMEDOUT && pollErr != unix.EINTR {
-				log.Printf("Sender Poll(timeout) error: %v", pollErr)
+				appLogger.Warn("Sender Poll(timeout) error: %v", pollErr)
 			}
 			numCompleted := xsk.NumCompleted()
 			if numCompleted > 0 {
@@ -307,17 +462,17 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			select {
 			case pktInfo, ok := <-packetQueue:
 				if !ok {
-					log.Println("Packet queue closed. Sender stopping fill loop.")
+					appLogger.Warn("Packet queue closed. Sender stopping fill loop.")
 					break fillLoop
 				}
 				if len(pktInfo.PacketBytes) == 0 {
-					log.Printf("Warning: Empty packet bytes for domain %s", pktInfo.Domain)
+					appLogger.Warn("Empty packet bytes for domain %s", pktInfo.Domain)
 					continue
 				}
 
 				frame := xsk.GetFrame(descs[descsFilled])
 				if len(frame) < len(pktInfo.PacketBytes) {
-					log.Printf("Error: Frame size (%d) too small for packet (%d bytes) for domain %s. Skipping.", len(frame), len(pktInfo.PacketBytes), pktInfo.Domain)
+					appLogger.Error("Frame size (%d) too small for packet (%d bytes) for domain %s. Skipping.", len(frame), len(pktInfo.PacketBytes), pktInfo.Domain)
 					continue
 				}
 
@@ -348,11 +503,11 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 			transmitStart := time.Now()
 			numSubmitted := xsk.Transmit(descs[:descsFilled])
 			recordTiming("Sender_Transmit", time.Since(transmitStart))
-			atomic.AddUint64(&statsPacketSentAttempted, uint64(descsFilled))
 
 			if numSubmitted < descsFilled {
-				log.Printf("Warning: Sender failed to submit %d packets (%d/%d). Manager will retry.", descsFilled-numSubmitted, numSubmitted, descsFilled)
+				appLogger.Warn("Sender failed to submit %d packets (%d/%d). Manager will retry.", descsFilled-numSubmitted, numSubmitted, descsFilled)
 			}
+
 		} else {
 			runtime.Gosched()
 		}
@@ -370,7 +525,7 @@ func packetSender(ctx context.Context, xsk *xdp.Socket, packetQueue <-chan Packe
 
 func finalizeTransmission(xsk *xdp.Socket, config *Config) {
 	if config.Verbose {
-		log.Println("Starting transmission finalization...")
+		appLogger.Info("Starting transmission finalization...")
 	}
 	startTime := time.Now()
 	timeout := 1000 * time.Millisecond
@@ -379,21 +534,21 @@ func finalizeTransmission(xsk *xdp.Socket, config *Config) {
 		numTransmitting := xsk.NumTransmitted()
 		if numTransmitting == 0 {
 			if config.Verbose {
-				log.Printf("Finalization: No packets transmitting after %.2fs.", time.Since(startTime).Seconds())
+				appLogger.Info("Finalization: No packets transmitting after %.2fs.", time.Since(startTime).Seconds())
 			}
 			break
 		}
 
 		_, _, pollErr := xsk.Poll(20)
 		if pollErr != nil && pollErr != unix.ETIMEDOUT && pollErr != unix.EINTR {
-			log.Printf("Final poll error: %v", pollErr)
+			appLogger.Warn("Final poll error: %v", pollErr)
 		}
 
 		completed := xsk.NumCompleted()
 		if completed > 0 {
 			xsk.Complete(completed)
 			if config.Verbose {
-				log.Printf("Finalization: Completed %d packets", completed)
+				appLogger.Info("Finalization: Completed %d packets", completed)
 			}
 
 		} else if pollErr == unix.ETIMEDOUT || pollErr == unix.EINTR || pollErr == nil {
@@ -405,18 +560,29 @@ func finalizeTransmission(xsk *xdp.Socket, config *Config) {
 
 	finalNumTransmitting := xsk.NumTransmitted()
 	if finalNumTransmitting > 0 {
-		log.Printf("Warning: Finalization finished, but %d packets still marked as transmitting.", finalNumTransmitting)
+		appLogger.Warn("Finalization finished, but %d packets still marked as transmitting.", finalNumTransmitting)
 	} else if config.Verbose {
-		log.Println("Finalization complete.")
+		appLogger.Success("Finalization complete.")
 	}
 }
 
-func statsCollector(updateChan <-chan StatsUpdateData, stopStats <-chan struct{}, programDone chan<- struct{}, config *Config) {
-	log.Println("Statistics collector started.")
+func statsCollector(updateChan <-chan StatsUpdateData, stopStats <-chan struct{}, programDone chan<- struct{}, config *Config, progressDisplay *ProgressDisplay) {
+	if !config.Quiet {
+		appLogger.Info("Statistics collector started.")
+	}
+
 	var lastUpdate StatsUpdateData
-	ticker := time.NewTicker(2 * time.Second)
+	statsInterval, _ := time.ParseDuration(config.StatsInterval)
+	if statsInterval <= 0 {
+		statsInterval = 2 * time.Second
+	}
+	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 	running := true
+
+	if progressDisplay != nil && !config.Quiet {
+		progressDisplay.Start()
+	}
 
 	for running {
 		select {
@@ -428,15 +594,17 @@ func statsCollector(updateChan <-chan StatsUpdateData, stopStats <-chan struct{}
 			lastUpdate = updateData
 
 		case <-ticker.C:
-			if lastUpdate.TotalDomains > 0 {
-				prog := 0.0
-
-				prog = float64(lastUpdate.RespondedDomains+lastUpdate.FailedDomains) / float64(lastUpdate.TotalDomains) * 100
-
-				log.Printf("\rD:%d | Rsp:%d | Fail:%d | Pend:%d | Rx:%d | RawTX:%d | RawRate:%d pps | RawAvg:%.1f pps | Time:%.1fs | Prog:%.1f%% ",
-					lastUpdate.TotalDomains, lastUpdate.RespondedDomains, lastUpdate.FailedDomains, lastUpdate.RetryingDomains,
-					lastUpdate.ReceivedPackets, lastUpdate.PacketsSentRaw, lastUpdate.PacketsPerSecRaw,
-					lastUpdate.AvgPacketsPerSecRaw, lastUpdate.Duration, prog)
+			if lastUpdate.TotalDomains > 0 && progressDisplay != nil && !config.Quiet {
+				queueSize := int64(lastUpdate.RetryingDomains)
+				progressDisplay.Update(
+					int64(lastUpdate.RespondedDomains),
+					int64(lastUpdate.FailedDomains),
+					int64(lastUpdate.RetryingDomains),
+					lastUpdate.PacketsSentRaw,
+					lastUpdate.ReceivedPackets,
+					queueSize,
+					lastUpdate.SmoothedPacketsPerSecRaw,
+				)
 			}
 
 		case <-stopStats:
@@ -445,29 +613,37 @@ func statsCollector(updateChan <-chan StatsUpdateData, stopStats <-chan struct{}
 		}
 	}
 
-	fmt.Println()
-	log.Println("Statistics collector shutting down.")
+	if progressDisplay != nil {
+		progressDisplay.Stop()
+	}
 
-	if lastUpdate.TotalDomains > 0 {
-		prog := float64(lastUpdate.RespondedDomains+lastUpdate.FailedDomains) / float64(lastUpdate.TotalDomains) * 100
-		log.Printf("Final Stats: D:%d | Rsp:%d | Fail:%d | Pend:%d | Rx:%d | RawTX:%d | RawRate:%d pps | RawAvg:%.1f pps | Time:%.1fs | Prog:%.1f%% ",
-			lastUpdate.TotalDomains, lastUpdate.RespondedDomains, lastUpdate.FailedDomains, lastUpdate.RetryingDomains,
-			lastUpdate.ReceivedPackets, lastUpdate.PacketsSentRaw, lastUpdate.PacketsPerSecRaw,
-			lastUpdate.AvgPacketsPerSecRaw, lastUpdate.Duration, prog)
+	if !config.Quiet {
+		fmt.Println()
+		appLogger.Info("Statistics collector shutting down.")
+
+		if lastUpdate.TotalDomains > 0 {
+			prog := float64(lastUpdate.RespondedDomains+lastUpdate.FailedDomains) / float64(lastUpdate.TotalDomains) * 100
+			statsLine := fmt.Sprintf("Final Stats: D:%d | Rsp:%d | Fail:%d | Pend:%d | Rx:%d | RawTX:%d | RawRate:%d pps | RawAvg:%.1f pps | Time:%.1fs | Prog:%.1f%%",
+				lastUpdate.TotalDomains, lastUpdate.RespondedDomains, lastUpdate.FailedDomains, lastUpdate.RetryingDomains,
+				lastUpdate.ReceivedPackets, lastUpdate.PacketsSentRaw, lastUpdate.PacketsPerSecRaw,
+				lastUpdate.AvgPacketsPerSecRaw, lastUpdate.Duration, prog)
+			appLogger.Info(statsLine)
+		}
 	}
 	programDone <- struct{}{}
 }
 
-func calculateAndSendStats(xsk *xdp.Socket, startTime time.Time, lastRawStats xdp.Stats, totalDomainsInFile int, domainsCurrentlyManaged int, statsUpdateChan chan<- StatsUpdateData) xdp.Stats {
+func calculateAndSendStats(xsk *xdp.Socket, startTime time.Time, lastRawStats xdp.Stats, lastStatsTime time.Time, smoothedPPS float64, totalDomainsInFile int, domainsCurrentlyManaged int, statsUpdateChan chan<- StatsUpdateData) (xdp.Stats, time.Time, float64) {
 	now := time.Now()
 	duration := now.Sub(startTime).Seconds()
 	currentReceived := atomic.LoadUint64(&receivedPackets)
 	curProcessed := atomic.LoadUint64(&totalDomainsProcessed)
+	curResponded := atomic.LoadUint64(&respondedDomainsCount)
 	curRawStats, _ := xsk.Stats()
 
 	intervalPacketsRaw := curRawStats.Completed - lastRawStats.Completed
 
-	intervalSeconds := 1.0
+	intervalSeconds := now.Sub(lastStatsTime).Seconds()
 	intervalRateRaw := uint64(0)
 	if intervalSeconds > 0 {
 		intervalRateRaw = uint64(float64(intervalPacketsRaw) / intervalSeconds)
@@ -477,23 +653,26 @@ func calculateAndSendStats(xsk *xdp.Socket, startTime time.Time, lastRawStats xd
 		avgRateRaw = float64(curRawStats.Completed) / duration
 	}
 
-	finalRespondedApproxUintPtr := cache.Len()
-	finalRespondedApprox := int(finalRespondedApproxUintPtr)
+	const smoothingFactor = 0.1 // Adjust for more or less smoothing
+	newSmoothedPPS := (float64(intervalRateRaw) * smoothingFactor) + (smoothedPPS * (1 - smoothingFactor))
+
+	finalRespondedApprox := int(curResponded)
 	finalFailedApprox := int(curProcessed) - finalRespondedApprox
 	if finalFailedApprox < 0 {
 		finalFailedApprox = 0
 	}
 
 	updateData := StatsUpdateData{
-		TotalDomains:        totalDomainsInFile,
-		RespondedDomains:    finalRespondedApprox,
-		RetryingDomains:     domainsCurrentlyManaged,
-		FailedDomains:       finalFailedApprox,
-		ReceivedPackets:     currentReceived,
-		PacketsSentRaw:      curRawStats.Completed,
-		PacketsPerSecRaw:    intervalRateRaw,
-		AvgPacketsPerSecRaw: avgRateRaw,
-		Duration:            duration,
+		TotalDomains:             totalDomainsInFile,
+		RespondedDomains:         finalRespondedApprox,
+		RetryingDomains:          domainsCurrentlyManaged,
+		FailedDomains:            finalFailedApprox,
+		ReceivedPackets:          currentReceived,
+		PacketsSentRaw:           curRawStats.Completed,
+		PacketsPerSecRaw:         intervalRateRaw,
+		AvgPacketsPerSecRaw:      avgRateRaw,
+		SmoothedPacketsPerSecRaw: newSmoothedPPS,
+		Duration:                 duration,
 	}
 
 	select {
@@ -501,406 +680,7 @@ func calculateAndSendStats(xsk *xdp.Socket, startTime time.Time, lastRawStats xd
 	default:
 	}
 
-	return curRawStats
-}
-
-func generateFinalReport(failedDomainsList []string, totalDomainsInFile int, startTime time.Time, xsk *xdp.Socket, config *Config) {
-	log.Println("Generating final report...")
-
-	skipCodes := make(map[int]struct{})
-	for _, code := range config.CodesToSkip {
-		skipCodes[code] = struct{}{}
-	}
-	finalResponded := 0
-	cache.ForEach(func(domainKey string, responseMsg *dns.Msg) bool {
-		if responseMsg != nil {
-			if _, skip := skipCodes[responseMsg.Rcode]; !skip {
-				finalResponded++
-			}
-		}
-		return true
-	})
-
-	finalFailed := len(failedDomainsList)
-
-	totalProcessedReport := finalResponded + finalFailed
-	globalProcessed := atomic.LoadUint64(&totalDomainsProcessed)
-
-	log.Println("Final report generation complete.")
-
-	fmt.Printf("\n--- Final Summary ---\n")
-	fmt.Printf("Total Domains Queried: %d (processed %d, report count %d)\n", totalDomainsInFile, globalProcessed, totalProcessedReport)
-	if int(globalProcessed) != totalProcessedReport {
-		fmt.Printf("  Warning: Discrepancy between final processed counter (%d) and report sum (%d)\n", globalProcessed, totalProcessedReport)
-	}
-	fmt.Printf("Responded (in output file): %d\n", finalResponded)
-	fmt.Printf("Failed (no valid response): %d\n", finalFailed)
-	fmt.Printf("Total Runtime: %.2f seconds\n", time.Since(startTime).Seconds())
-	finalReceived := atomic.LoadUint64(&receivedPackets)
-	fmt.Printf("Total Packets Received (BPF): %d\n", finalReceived)
-	finalSentXDP, _ := xsk.Stats()
-	fmt.Printf("Total Packets Sent (XDP Completed): %d\n", finalSentXDP.Completed)
-	if finalFailed > 0 {
-		fmt.Println("\nDomains without valid responses (limit 20):")
-		limit := 20
-		if finalFailed < limit {
-			limit = finalFailed
-		}
-		for i := 0; i < limit; i++ {
-			fmt.Printf("- %s\n", failedDomainsList[i])
-		}
-		if finalFailed > limit {
-			fmt.Printf("- ... (and %d more)\n", finalFailed-limit)
-		}
-	}
-	fmt.Println("---------------------")
-}
-
-func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, domainStates *haxmap.Map[string, *DomainStatus], packetTemplate []byte, config *Config, rng *rand.Rand) int {
-	if config.Verbose {
-		log.Printf("Feeding batch of %d domains...", len(domainsToFeed))
-	}
-	addedAndQueued := 0
-	now := time.Now()
-
-	for _, fqdn := range domainsToFeed {
-		if len(config.Nameservers) == 0 {
-			log.Printf("Error preparing packet for %s: No nameservers configured. Skipping this domain.", fqdn)
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-			continue
-		}
-		currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
-		dstIP := net.ParseIP(currentNameserver)
-		if dstIP == nil {
-			log.Printf("Error preparing packet for %s: Invalid nameserver IP %s. Skipping this domain.", fqdn, currentNameserver)
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-			continue
-		}
-
-		packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
-		if err != nil {
-			log.Printf("Error preparing initial packet for %s: %v. Skipping this domain.", fqdn, err)
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-			continue
-		}
-		pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: 1}
-
-		// Set the new domain status. Haxmap handles concurrent writes.
-		// We only do this once per domain, so a simple Set is fine.
-		domainStates.Set(fqdn, &DomainStatus{
-			AttemptsMade: 1,
-			Responded:    false,
-			LastAttempt:  now,
-		})
-		addedAndQueued++
-
-		packetQueue <- pktInfo
-	}
-	if config.Verbose {
-		log.Printf("Fed batch complete. Added/Queued %d domains.", addedAndQueued)
-	}
-	return addedAndQueued
-}
-
-func checkAndRetryDomains(domainStates *haxmap.Map[string, *DomainStatus], packetQueue chan<- PacketInfo, packetTemplate []byte, config *Config, rng *rand.Rand, failedDomainsList *[]string) (pendingCount int) {
-	defer timeOperation("Manager_RetryCheck")()
-	now := time.Now()
-	domainsToRetry := make(map[string]int) // map fqdn to current attempt count
-	domainsToRemove := []string{}
-	maxRetries := config.Retries + 1
-	var currentPending int
-
-	domainStates.ForEach(func(fqdn string, status *DomainStatus) bool {
-		status.mu.Lock()
-
-		if !status.Responded {
-			if _, found := cache.Get(fqdn); found {
-				status.Responded = true
-			}
-		}
-
-		if status.Responded {
-			domainsToRemove = append(domainsToRemove, fqdn)
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-		} else if status.AttemptsMade >= maxRetries {
-			domainsToRemove = append(domainsToRemove, fqdn)
-			*failedDomainsList = append(*failedDomainsList, fqdn)
-			atomic.AddUint64(&totalDomainsProcessed, 1)
-		} else if !status.LastAttempt.IsZero() && now.Sub(status.LastAttempt) > config.RetryTimeout {
-			domainsToRetry[fqdn] = status.AttemptsMade
-		} else {
-			currentPending++
-		}
-
-		status.mu.Unlock()
-		return true // Continue iteration
-	})
-
-	for _, fqdn := range domainsToRemove {
-		domainStates.Del(fqdn)
-	}
-
-	queuedCount := 0
-	failedToPrepareCount := 0
-
-	if len(domainsToRetry) > 0 {
-		for fqdn, currentAttempt := range domainsToRetry {
-			currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
-			dstIP := net.ParseIP(currentNameserver)
-			if dstIP == nil {
-				log.Printf("Error preparing retry packet for %s: Invalid nameserver IP %s. Marking failed.", fqdn, currentNameserver)
-				failedToPrepareCount++
-				domainStates.Del(fqdn)
-				*failedDomainsList = append(*failedDomainsList, fqdn)
-				atomic.AddUint64(&totalDomainsProcessed, 1)
-				continue
-			}
-			packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
-			if err != nil {
-				log.Printf("Error preparing retry packet for %s (attempt %d): %v. Marking failed.", fqdn, currentAttempt+1, err)
-				failedToPrepareCount++
-				domainStates.Del(fqdn)
-				*failedDomainsList = append(*failedDomainsList, fqdn)
-				atomic.AddUint64(&totalDomainsProcessed, 1)
-				continue
-			}
-
-			pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: currentAttempt + 1}
-			packetQueue <- pktInfo
-			queuedCount++
-
-			if status, ok := domainStates.Get(fqdn); ok {
-				status.mu.Lock()
-				if !status.Responded {
-					status.AttemptsMade++
-					status.LastAttempt = time.Now()
-				}
-				status.mu.Unlock()
-			}
-		}
-	}
-
-	return int(domainStates.Len())
-}
-
-func transmitPackets(xsk *xdp.Socket, allInputDomains []string, config *Config, shutdownChan <-chan struct{}) error {
-
-	domainStates := haxmap.New[string, *DomainStatus]()
-	var failedDomainsList []string
-
-	initialTotalDomains := len(allInputDomains)
-	if initialTotalDomains == 0 {
-		log.Println("No domains to process.")
-		return nil
-	}
-	log.Printf("Loaded %d domains. Starting asynchronous preparation...", initialTotalDomains)
-	atomic.StoreUint64(&totalDomainsProcessed, 0)
-
-	// --- Channels for async domain processing ---
-	processedDomainsChan := make(chan string, config.MaxBatchSize*4)
-	uniqueDomainCountChan := make(chan int, 1)
-
-	// --- Start async domain processor ---
-	go func(domains []string) {
-		log.Println("Async domain processor started.")
-		// 1. Normalize and deduplicate
-		uniqueFqdns := make(map[string]struct{}, len(domains))
-
-		numWorkers := runtime.NumCPU()
-		if numWorkers > len(domains)/1000 && len(domains) > 1000 {
-			numWorkers = len(domains) / 1000
-		}
-		if numWorkers == 0 {
-			numWorkers = 1
-		}
-		fqdnChan := make(chan string, len(domains))
-		var wg sync.WaitGroup
-
-		processChunk := func(chunk []string) {
-			defer wg.Done()
-			for _, domain := range chunk {
-				processedDomain := strings.TrimSpace(domain)
-				if processedDomain == "" {
-					continue
-				}
-				if !strings.HasSuffix(processedDomain, ".") {
-					processedDomain += "."
-				}
-				fqdnChan <- processedDomain
-			}
-		}
-
-		chunkSize := (len(domains) + numWorkers - 1) / numWorkers
-		wg.Add(numWorkers)
-		for i := 0; i < numWorkers; i++ {
-			start := i * chunkSize
-			end := start + chunkSize
-			if end > len(domains) {
-				end = len(domains)
-			}
-			if start >= end {
-				wg.Done()
-				continue
-			}
-			go processChunk(domains[start:end])
-		}
-
-		go func() {
-			wg.Wait()
-			close(fqdnChan)
-		}()
-
-		for fqdn := range fqdnChan {
-			uniqueFqdns[fqdn] = struct{}{}
-		}
-
-		log.Printf("Async preparation complete. Processing %d unique FQDN domains.", len(uniqueFqdns))
-		uniqueDomainCountChan <- len(uniqueFqdns)
-		close(uniqueDomainCountChan)
-
-		// 2. Stream unique domains to the manager
-		for fqdn := range uniqueFqdns {
-			processedDomainsChan <- fqdn
-		}
-		close(processedDomainsChan)
-		log.Println("Async domain processor finished feeding all domains.")
-	}(allInputDomains)
-
-	initialQueueCapacity := config.MaxBatchSize * 4
-	if initialQueueCapacity < 2048 {
-		initialQueueCapacity = 2048
-	}
-	packetQueue := make(chan PacketInfo, initialQueueCapacity)
-	log.Printf("Packet queue capacity: %d", initialQueueCapacity)
-
-	stopStats := make(chan struct{})
-	programDone := make(chan struct{})
-	var senderWg sync.WaitGroup
-	statsUpdateChan := make(chan StatsUpdateData, 20)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start bottleneck reporter if in verbose mode
-	var reporterWg sync.WaitGroup
-	if config.Verbose {
-		reporterWg.Add(1)
-		go func() {
-			defer reporterWg.Done()
-			bottleneckReporter(ctx, config)
-		}()
-	}
-
-	go statsCollector(statsUpdateChan, stopStats, programDone, config)
-	senderWg.Add(1)
-
-	go packetSender(ctx, xsk, packetQueue, &senderWg, config, domainStates)
-
-	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-	link, err := netlink.LinkByName(config.NIC)
-	if err != nil {
-		log.Fatalf("Failed to get link by name: %v", err)
-	}
-	srcMAC, dstMAC, err := ResolveMACAddresses(config, link)
-	if err != nil {
-		log.Fatalf("Failed to resolve MAC addresses: %v", err)
-	}
-	srcIP := net.ParseIP(config.SrcIP)
-	if srcIP == nil {
-		log.Fatalf("Failed to parse source IP: %v", err)
-	}
-
-	packetTemplate, err := createPacketTemplate(srcIP, srcMAC, dstMAC, config)
-	if err != nil {
-		log.Fatalf("Failed to create packet template: %v", err)
-	}
-
-	startTime := time.Now()
-
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	var lastRawStats xdp.Stats
-	domainsCurrentlyManaged := 0
-	totalDomainsForStats := initialTotalDomains
-
-loop:
-	for {
-		select {
-		case <-shutdownChan:
-			log.Println("Shutdown signal received by manager. Stopping loop.")
-			break loop
-		case count, ok := <-uniqueDomainCountChan:
-			if ok {
-				totalDomainsForStats = count
-			}
-			uniqueDomainCountChan = nil // Stop selecting on it so the case doesn't fire again
-		case <-ticker.C:
-			// The entire management logic now runs on a schedule instead of a busy-loop.
-			pendingCount := checkAndRetryDomains(domainStates, packetQueue, packetTemplate, config, rng, &failedDomainsList)
-			domainsCurrentlyManaged = pendingCount
-
-			// Feed new domains from the async processor
-			feedThreshold := config.MaxBatchSize
-			if domainsCurrentlyManaged < feedThreshold && processedDomainsChan != nil {
-				domainsToFeed := make([]string, 0, config.MaxBatchSize*2)
-			batchFillLoop:
-				for i := 0; i < config.MaxBatchSize*2; i++ {
-					select {
-					case fqdn, ok := <-processedDomainsChan:
-						if !ok {
-							processedDomainsChan = nil // sentinel for closed channel
-							break batchFillLoop
-						}
-						domainsToFeed = append(domainsToFeed, fqdn)
-					default:
-						// Channel is empty for now, stop trying to fill the batch
-						break batchFillLoop
-					}
-				}
-				if len(domainsToFeed) > 0 {
-					feedStart := time.Now()
-					added := feedDomainsToQueue(domainsToFeed, packetQueue, domainStates, packetTemplate, config, rng)
-					domainsCurrentlyManaged += added
-					recordTiming("Manager_FeedQueue", time.Since(feedStart))
-				}
-			}
-
-			statsStart := time.Now()
-			lastRawStats = calculateAndSendStats(xsk, startTime, lastRawStats, totalDomainsForStats, domainsCurrentlyManaged, statsUpdateChan)
-			recordTiming("Manager_CalculateStats", time.Since(statsStart))
-
-			// Exit condition: domain processor is done and no domains are left in-flight.
-			if processedDomainsChan == nil && domainsCurrentlyManaged == 0 {
-				log.Printf("All domains processed and queue/retries are clear.")
-				break loop
-			}
-		}
-	}
-
-	log.Println("Stopping packet sender via context cancellation...")
-	cancel()
-	senderWg.Wait()
-	log.Println("Packet sender stopped.")
-	if config.Verbose {
-		reporterWg.Wait()
-		log.Println("Bottleneck reporter stopped.")
-	}
-
-	log.Println("Closing packet queue...")
-	close(packetQueue)
-
-	log.Println("Stopping statistics collector...")
-	close(stopStats)
-	<-programDone
-	log.Println("Statistics collector stopped.")
-
-	if config.Verbose {
-		log.Println("--- Final Performance Analysis ---")
-		printPerformanceReport(config)
-	}
-	generateFinalReport(failedDomainsList, totalDomainsForStats, startTime, xsk, config)
-
-	return nil
+	return curRawStats, now, newSmoothedPPS
 }
 
 type PrettyDnsFlags struct {
@@ -1048,61 +828,127 @@ func prettifyDnsMsg(msg *dns.Msg) *PrettyDnsMsg {
 	return pretty
 }
 
-func saveCachePrettified(config *Config) {
+func feedDomainsToQueue(domainsToFeed []string, packetQueue chan<- PacketInfo, domainStates *haxmap.Map[string, *DomainStatus], processedHistory *haxmap.Map[string, struct{}], packetTemplate []byte, config *Config, rng *rand.Rand, errorGrouper *ErrorGrouper) int {
+	if config.Verbose {
+		appLogger.Debug("Feeding batch of %d domains...", len(domainsToFeed))
+	}
+	addedAndQueued := 0
+	now := time.Now()
+
+	for _, fqdn := range domainsToFeed {
+		// Full deduplication against all domains ever queued using the new history map.
+		if _, loaded := processedHistory.GetOrSet(fqdn, struct{}{}); loaded {
+			continue // Domain already seen, skip.
+		}
+
+		// If we are here, it's a new, unique domain.
+		atomic.AddUint64(&totalUniqueDomains, 1)
+
+		// Set initial state for in-flight tracking.
+		domainStates.Set(fqdn, &DomainStatus{
+			AttemptsMade: 1,
+			Responded:    false,
+			LastAttempt:  now,
+		})
+
+		if len(config.Nameservers) == 0 {
+			err := fmt.Errorf("no nameservers configured")
+			errorGrouper.RecordError(err, fqdn)
+			if config.Verbose {
+				appLogger.Error("Error preparing packet for %s: No nameservers configured. Skipping this domain.", fqdn)
+			}
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			domainStates.Del(fqdn) // Clean up state for skipped domain
+			continue
+		}
+		currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
+		dstIP := net.ParseIP(currentNameserver)
+		if dstIP == nil {
+			err := fmt.Errorf("invalid nameserver IP: %s", currentNameserver)
+			errorGrouper.RecordError(err, fqdn)
+			if config.Verbose {
+				appLogger.Error("Error preparing packet for %s: Invalid nameserver IP %s. Skipping this domain.", fqdn, currentNameserver)
+			}
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			domainStates.Del(fqdn) // Clean up state for skipped domain
+			continue
+		}
+
+		packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
+		if err != nil {
+			errorGrouper.RecordError(err, fqdn)
+			if config.Verbose {
+				appLogger.Error("Error preparing initial packet for %s: %v. Skipping this domain.", fqdn, err)
+			}
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			domainStates.Del(fqdn) // Clean up state for skipped domain
+			continue
+		}
+		pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: 1}
+		addedAndQueued++
+		packetQueue <- pktInfo
+	}
+	if config.Verbose {
+		appLogger.Debug("Fed batch complete. Added/Queued %d domains.", addedAndQueued)
+	}
+	return addedAndQueued
+}
+
+func runAsyncResultWriter(config *Config) (chan<- []byte, func() (int64, int64, int64)) {
 	if config.OutputFile == "" {
-		log.Println("No output file specified, skipping save.")
-		return
+		// Return a dummy channel and a no-op closer if no output file is specified.
+		dummyChan := make(chan []byte)
+		go func() {
+			for range dummyChan {
+			}
+		}()
+		return dummyChan, func() (int64, int64, int64) {
+			close(dummyChan)
+			return 0, 0, 0
+		}
 	}
 
-	log.Printf("Saving cached responses to %s...", config.OutputFile)
-	file, err := os.Create(config.OutputFile)
-	if err != nil {
-		log.Printf("Error creating output file '%s': %v", config.OutputFile, err)
-		return
-	}
-	defer file.Close()
+	// This channel receives the raw DNS payloads from the main manager loop.
+	payloadChan := make(chan []byte, 16384)
 
-	// Use a buffered writer for efficient I/O
-	writer := bufio.NewWriterSize(file, 65536) // Increased buffer size
-	defer writer.Flush()
+	// This channel receives the marshalled JSON data from the parsing workers.
+	jsonChan := make(chan []byte, 16384)
 
-	skipCodes := make(map[int]struct{})
-	for _, code := range config.CodesToSkip {
-		skipCodes[code] = struct{}{}
-	}
+	var wgParser sync.WaitGroup
+	var wgWriter sync.WaitGroup
 
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
-	// Channels for distributing work and collecting results
-	jobs := make(chan *dns.Msg, numWorkers*2)
-	results := make(chan []byte, numWorkers*2)
-	var wgWorkers sync.WaitGroup
-	var wgWriter sync.WaitGroup
 
-	var savedCount, skippedCount atomic.Int64 // Use atomic for concurrent updates
+	var savedCount, skippedCount, errorCount atomic.Int64
 
-	// Start worker goroutines
-	wgWorkers.Add(numWorkers)
+	// Start Parser Workers to parallelize the CPU-intensive work (unpack/marshal)
+	wgParser.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		go func() {
-			defer wgWorkers.Done()
-			for msg := range jobs {
+			defer wgParser.Done()
+			skipCodes := make(map[int]struct{})
+			for _, code := range config.CodesToSkip {
+				skipCodes[code] = struct{}{}
+			}
+
+			for payload := range payloadChan {
+				msg := new(dns.Msg)
+				if err := msg.Unpack(payload); err != nil {
+					errorCount.Add(1)
+					continue
+				}
+
 				if _, skip := skipCodes[msg.Rcode]; !skip {
 					prettyMsg := prettifyDnsMsg(msg)
 					jsonData, err := json.Marshal(prettyMsg)
 					if err != nil {
-						// Log marshalling errors but continue processing other messages
-						// Find the domain name from the question section for logging
-						domainName := "unknown"
-						if len(msg.Question) > 0 {
-							domainName = msg.Question[0].Name
-						}
-						log.Printf("Error marshalling JSON for domain %s: %v", domainName, err)
-						continue // Skip sending this result
+						errorCount.Add(1)
+						continue
 					}
-					results <- jsonData // Send marshalled JSON to the writer channel
+					jsonChan <- jsonData
 					savedCount.Add(1)
 				} else {
 					skippedCount.Add(1)
@@ -1111,86 +957,525 @@ func saveCachePrettified(config *Config) {
 		}()
 	}
 
-	// Start the writer goroutine
+	// Start a single File Writer Goroutine to serialize disk I/O
 	wgWriter.Add(1)
 	go func() {
 		defer wgWriter.Done()
-		for jsonData := range results {
-			_, err := writer.Write(jsonData)
-			if err == nil {
-				_, err = writer.WriteString("\n")
-			}
-			if err != nil {
-				// Log write errors; potentially stop processing if disk is full, etc.
-				// For now, just log the error and continue.
-				log.Printf("Error writing to output file: %v", err)
-				// Consider adding logic here to handle persistent write errors,
-				// maybe by cancelling the context or signalling other goroutines.
-			}
+		appLogger.Info("Async result writer started. Saving to %s...", config.OutputFile)
+		file, err := os.Create(config.OutputFile)
+		if err != nil {
+			appLogger.Fatal("Error creating output file '%s': %v. Writer will not run.", config.OutputFile, err)
+			return
 		}
+		defer file.Close()
+
+		writer := bufio.NewWriterSize(file, 65536)
+		defer writer.Flush()
+
+		for jsonData := range jsonChan {
+			_, _ = writer.Write(jsonData)
+			_, _ = writer.WriteString("\n")
+		}
+		appLogger.Success("Async result writer finished writing to file.")
 	}()
 
-	// Feed the jobs channel from the cache
-	// Note: cache.ForEach might block if the jobs channel is full.
-	// The iteration itself is sequential, but processing happens in parallel.
-	cache.ForEach(func(domainKey string, responseMsg *dns.Msg) bool {
-		if responseMsg != nil {
-			jobs <- responseMsg // Send message to workers
-		}
-		return true // Continue iteration
-	})
-
-	// Close the jobs channel once all items from the cache are sent
-	close(jobs)
-
-	// Wait for all worker goroutines to finish
-	wgWorkers.Wait()
-
-	// Close the results channel once all workers are done
-	close(results)
-
-	// Wait for the writer goroutine to finish writing all results
-	wgWriter.Wait()
-
-	// Ensure the buffer is flushed before returning
-	err = writer.Flush()
-	if err != nil {
-		log.Printf("Error flushing writer for output file '%s': %v", config.OutputFile, err)
+	// The function to be called to gracefully shut everything down
+	closeFn := func() (int64, int64, int64) {
+		close(payloadChan) // 1. Signal parsers no more payloads are coming
+		wgParser.Wait()    // 2. Wait for all parsers to finish
+		close(jsonChan)    // 3. Signal writer no more JSON is coming
+		wgWriter.Wait()    // 4. Wait for writer to finish
+		appLogger.Info("Async result writer has shut down.")
+		return savedCount.Load(), skippedCount.Load(), errorCount.Load()
 	}
 
-	log.Printf("Finished saving cache. Saved %d responses, skipped %d based on RCODE.", savedCount.Load(), skippedCount.Load())
+	// Return the channel that the main application will write payloads to
+	return payloadChan, closeFn
+}
+
+func transmitPackets(xsk *xdp.Socket, domainsFile string, config *Config, shutdownChan <-chan struct{}, totalDomainsInFile int, errorGrouper *ErrorGrouper) error {
+
+	processedHistory := haxmap.New[string, struct{}]()
+	domainStates := haxmap.New[string, *DomainStatus]()
+	var failedDomainsList []string
+
+	atomic.StoreUint64(&totalDomainsProcessed, 0)
+	atomic.StoreUint64(&totalUniqueDomains, 0)
+	atomic.StoreUint64(&respondedDomainsCount, 0)
+	atomic.StoreUint64(&domainsRequiringRetries, 0)
+	atomic.StoreUint64(&totalRetryAttempts, 0)
+	atomic.StoreUint64(&firstAttemptSuccesses, 0)
+
+	// --- Channel for streaming domains from file ---
+	processedDomainsChan := make(chan string, config.MaxBatchSize*4)
+
+	// --- Start file streaming goroutine ---
+	go func() {
+		// Delay domain streaming slightly to allow progress display to initialize
+		time.Sleep(100 * time.Millisecond)
+		streamDomainsFromFile(domainsFile, processedDomainsChan)
+	}()
+
+	initialQueueCapacity := config.MaxBatchSize * 4
+	if initialQueueCapacity < 2048 {
+		initialQueueCapacity = 2048
+	}
+	packetQueue := make(chan PacketInfo, initialQueueCapacity)
+	if !config.Quiet {
+		appLogger.Info("Packet queue capacity: %d", initialQueueCapacity)
+	}
+
+	stopStats := make(chan struct{})
+	programDone := make(chan struct{})
+	var senderWg sync.WaitGroup
+	statsUpdateChan := make(chan StatsUpdateData, 20)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create progress display
+	var progressDisplay *ProgressDisplay
+	if !config.Quiet {
+		progressDisplay = NewProgressDisplay(int64(totalDomainsInFile))
+	}
+
+	// Start bottleneck reporter if in verbose mode
+	var reporterWg sync.WaitGroup
+	if config.Verbose {
+		reporterWg.Add(1)
+		go func() {
+			defer reporterWg.Done()
+			bottleneckReporter(ctx, config)
+		}()
+	}
+
+	go statsCollector(statsUpdateChan, stopStats, programDone, config, progressDisplay)
+	senderWg.Add(1)
+
+	go packetSender(ctx, xsk, packetQueue, &senderWg, config, domainStates)
+
+	// Start the async result writer
+	writeChan, closeWriter := runAsyncResultWriter(config)
+
+	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	link, err := netlink.LinkByName(config.NIC)
+	if err != nil {
+		appLogger.Fatal("Failed to get link by name: %v", err)
+	}
+	srcMAC, dstMAC, err := ResolveMACAddresses(config, link)
+	if err != nil {
+		appLogger.Fatal("Failed to resolve MAC addresses: %v", err)
+	}
+	srcIP := net.ParseIP(config.SrcIP)
+	if srcIP == nil {
+		appLogger.Fatal("Failed to parse source IP: %v", err)
+	}
+
+	packetTemplate, err := createPacketTemplate(srcIP, srcMAC, dstMAC, config)
+	if err != nil {
+		appLogger.Fatal("Failed to create packet template: %v", err)
+	}
+
+	startTime := time.Now()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastRawStats xdp.Stats
+	var lastStatsTime = startTime
+	var smoothedPPS float64
+	domainsCurrentlyManaged := 0
+	noProgressTicks := 0
+	const noProgressTimeoutTicks = 200 // 10 seconds at a 50ms tick rate
+
+loop:
+	for {
+		select {
+		case <-shutdownChan:
+			appLogger.Warn("Shutdown signal received by manager. Stopping loop.")
+			break loop
+		case <-ticker.C:
+			prevPending := domainsCurrentlyManaged
+			// The entire management logic now runs on a schedule instead of a busy-loop.
+			pendingCount := checkAndRetryDomains(ctx, domainStates, packetQueue, packetTemplate, config, rng, &failedDomainsList, writeChan, false)
+			domainsCurrentlyManaged = pendingCount
+
+			// Feed new domains from the async processor
+			feedThreshold := config.MaxBatchSize
+			if domainsCurrentlyManaged < feedThreshold && processedDomainsChan != nil {
+				domainsToFeed := make([]string, 0, config.MaxBatchSize*2)
+			batchFillLoop:
+				for i := 0; i < config.MaxBatchSize*2; i++ {
+					select {
+					case fqdn, ok := <-processedDomainsChan:
+						if !ok {
+							processedDomainsChan = nil // sentinel for closed channel
+							appLogger.Info("Domain streaming finished.")
+							break batchFillLoop
+						}
+						// Normalize domain on the fly
+						processedDomain := strings.TrimSpace(fqdn)
+						if processedDomain != "" {
+							if !strings.HasSuffix(processedDomain, ".") {
+								processedDomain += "."
+							}
+							domainsToFeed = append(domainsToFeed, processedDomain)
+						}
+					default:
+						// Channel is empty for now, stop trying to fill the batch
+						break batchFillLoop
+					}
+				}
+				if len(domainsToFeed) > 0 {
+					feedStart := time.Now()
+					added := feedDomainsToQueue(domainsToFeed, packetQueue, domainStates, processedHistory, packetTemplate, config, rng, errorGrouper)
+					domainsCurrentlyManaged += added
+					recordTiming("Manager_FeedQueue", time.Since(feedStart))
+				}
+			}
+
+			statsStart := time.Now()
+			lastRawStats, lastStatsTime, smoothedPPS = calculateAndSendStats(xsk, startTime, lastRawStats, lastStatsTime, smoothedPPS, totalDomainsInFile, domainsCurrentlyManaged, statsUpdateChan)
+			recordTiming("Manager_CalculateStats", time.Since(statsStart))
+
+			// Stalemate and exit condition logic
+			if processedDomainsChan == nil {
+				if domainsCurrentlyManaged == 0 {
+					appLogger.Success("\nAll domains processed and queue/retries are clear.")
+					break loop
+				}
+
+				// Check for stalemate
+				if domainsCurrentlyManaged > 0 && domainsCurrentlyManaged == prevPending {
+					noProgressTicks++
+				} else {
+					noProgressTicks = 0 // Progress was made, reset counter
+				}
+
+				if noProgressTicks > noProgressTimeoutTicks {
+					appLogger.Warn("\nStalemate detected. Forcing exit with %d pending domains.", domainsCurrentlyManaged)
+					domainStates.ForEach(func(fqdn string, status *DomainStatus) bool {
+						failedDomainsList = append(failedDomainsList, fqdn)
+						return true
+					})
+					break loop
+				}
+			}
+		}
+	}
+
+	appLogger.Info("Manager loop finished. Draining final responses...")
+	checkAndRetryDomains(ctx, domainStates, packetQueue, packetTemplate, config, rng, &failedDomainsList, writeChan, true)
+
+	appLogger.Info("Stopping packet sender via context cancellation...")
+	cancel()
+	senderWg.Wait()
+	appLogger.Success("Packet sender stopped.")
+	if config.Verbose {
+		reporterWg.Wait()
+		appLogger.Info("Bottleneck reporter stopped.")
+	}
+
+	appLogger.Info("Closing packet queue...")
+	close(packetQueue)
+
+	appLogger.Info("Stopping statistics collector...")
+	close(stopStats)
+	<-programDone
+	appLogger.Success("Statistics collector stopped.")
+
+	appLogger.Info("Closing result writer and waiting for completion...")
+	savedCount, skippedCount, errorCount := closeWriter()
+
+	if config.Verbose {
+		printPerformanceReport(config)
+	}
+
+	// --- Enhanced Final Summary ---
+	if !config.Quiet {
+		fmt.Println()
+		fmt.Println(strings.Repeat("═", 60))
+		appLogger.Success("📊 PugDNS Scan Report")
+		fmt.Println(strings.Repeat("═", 60))
+
+		// Results Summary
+		fmt.Println()
+		appLogger.Info("📈 Results Summary:")
+		finalFailed := len(failedDomainsList)
+		uniqueDomains := atomic.LoadUint64(&totalUniqueDomains)
+		successRate := float64(savedCount) / float64(uniqueDomains) * 100
+
+		appLogger.Info("  ├─ Total Domains: %s", formatNumber(int64(uniqueDomains)))
+		appLogger.Info("  ├─ Successful: %s (%.1f%%)", formatNumber(savedCount), successRate)
+		appLogger.Info("  ├─ Failed: %s (%.1f%%)", formatNumber(int64(finalFailed)), float64(finalFailed)/float64(uniqueDomains)*100)
+		if skippedCount > 0 {
+			appLogger.Info("  ├─ Filtered (RCODE): %s", formatNumber(skippedCount))
+		}
+		if errorCount > 0 {
+			appLogger.Info("  └─ Write Errors: %s", formatNumber(errorCount))
+		}
+
+		// Performance Metrics
+		fmt.Println()
+		appLogger.Info("⚡ Performance Metrics:")
+		totalRuntime := time.Since(startTime).Seconds()
+		avgRate := float64(atomic.LoadUint64(&totalDomainsProcessed)) / totalRuntime
+		finalSentXDP, _ := xsk.Stats()
+
+		// Calculate packet efficiency - how many packets per domain on average
+		avgPacketsPerDomain := float64(finalSentXDP.Completed) / float64(uniqueDomains)
+		packetOverhead := ((float64(finalSentXDP.Completed) - float64(uniqueDomains)) / float64(uniqueDomains)) * 100
+
+		appLogger.Info("  ├─ Total Runtime: %s", formatDuration(time.Since(startTime)))
+		appLogger.Info("  ├─ Average Rate: %.0f queries/sec", avgRate)
+		appLogger.Info("  ├─ Avg Packets/Domain: %.2f", avgPacketsPerDomain)
+		appLogger.Info("  └─ Packet Overhead: %.1f%%", packetOverhead)
+
+		// Query Efficiency Metrics
+		fmt.Println()
+		appLogger.Info("🎯 Query Efficiency:")
+		finalFirstAttempts := atomic.LoadUint64(&firstAttemptSuccesses)
+		finalDomainsNeedingRetries := atomic.LoadUint64(&domainsRequiringRetries)
+		finalTotalRetries := atomic.LoadUint64(&totalRetryAttempts)
+
+		firstAttemptRate := float64(finalFirstAttempts) / float64(uniqueDomains) * 100
+		retryRate := float64(finalDomainsNeedingRetries) / float64(uniqueDomains) * 100
+
+		appLogger.Info("  ├─ First-attempt Success: %.1f%% (%s/%s domains)",
+			firstAttemptRate, formatNumber(int64(finalFirstAttempts)), formatNumber(int64(uniqueDomains)))
+		appLogger.Info("  ├─ Domains Requiring Retries: %.1f%% (%s domains)",
+			retryRate, formatNumber(int64(finalDomainsNeedingRetries)))
+		appLogger.Info("  └─ Total Retry Attempts: %s", formatNumber(int64(finalTotalRetries)))
+
+		// Network Statistics
+		fmt.Println()
+		appLogger.Info("🌐 Network Statistics:")
+		finalReceived := atomic.LoadUint64(&receivedPackets)
+		networkLoss := (1 - float64(finalReceived)/float64(finalSentXDP.Completed)) * 100
+		appLogger.Info("  ├─ Packets Sent: %s", formatNumber(int64(finalSentXDP.Completed)))
+		appLogger.Info("  ├─ Packets Received: %s", formatNumber(int64(finalReceived)))
+		appLogger.Info("  └─ Network Packet Loss: %.2f%%", networkLoss)
+
+		// Failed domains sample
+		if finalFailed > 0 && config.Verbose {
+			fmt.Println()
+			appLogger.Warn("❌ Sample of failed domains (showing up to 10):")
+			limit := 10
+			if finalFailed < limit {
+				limit = finalFailed
+			}
+			for i := 0; i < limit; i++ {
+				appLogger.Info("  • %s", failedDomainsList[i])
+			}
+			if finalFailed > limit {
+				appLogger.Info("  • ... and %d more", finalFailed-limit)
+			}
+		}
+
+		fmt.Println(strings.Repeat("═", 60))
+	}
+
+	return nil
+}
+
+func countLines(filename string) (int, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return 0, fmt.Errorf("error opening file '%s' for counting: %w", filename, err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	// Increase buffer size for scanner to handle long lines efficiently.
+	const maxCapacity = 1024 * 1024
+	buf := make([]byte, maxCapacity)
+	scanner.Buffer(buf, maxCapacity)
+
+	count := 0
+	for scanner.Scan() {
+		// We only care about non-empty lines, to match the streaming logic.
+		if len(bytes.TrimSpace(scanner.Bytes())) > 0 {
+			count++
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return 0, fmt.Errorf("error scanning file '%s': %w", filename, err)
+	}
+
+	return count, nil
 }
 
 func main() {
+	// Support environment variables
+	if envInterface := os.Getenv("PUGDNS_INTERFACE"); envInterface != "" {
+		os.Args = append(os.Args, "-interface", envInterface)
+	}
+	if envNameservers := os.Getenv("PUGDNS_NAMESERVERS"); envNameservers != "" {
+		os.Args = append(os.Args, "-nameservers", envNameservers)
+	}
 
 	config := DefaultConfig()
 
+	// File inputs
 	domainsFile := flag.String("domains", "", "File containing domains to query (one per line)")
 	nameserversFile := flag.String("nameservers", "", "File containing nameservers to use (one per line)")
+	configFile := flag.String("config", "", "Configuration file (YAML or JSON)")
 
+	// Operation modes
+	showVersion := flag.Bool("version", false, "Show version information")
+	generateConfig := flag.String("generate-config", "", "Generate example configuration file")
+	pprofEnabled := flag.Bool("pprof", false, "Enable pprof debugging server on localhost:6060")
+	flag.BoolVar(&config.DryRun, "dry-run", config.DryRun, "Validate configuration without sending packets")
+
+	// Display options
+	logLevel := flag.String("loglevel", "info", "Set log level (debug, info, warn, error)")
+	flag.BoolVar(&config.Verbose, "verbose", config.Verbose, "Enable verbose logging")
+	flag.BoolVar(&config.Quiet, "quiet", config.Quiet, "Suppress all output except errors and final summary")
+	flag.StringVar(&config.StatsInterval, "stats-interval", config.StatsInterval, "Statistics update interval (e.g., 2s, 500ms)")
+
+	// Network configuration
 	flag.StringVar(&config.NIC, "interface", config.NIC, "Network interface")
 	flag.IntVar(&config.QueueID, "queue", config.QueueID, "Interface queue ID")
 	flag.StringVar(&config.SrcMAC, "srcmac", config.SrcMAC, "Source MAC (optional, uses interface MAC if empty)")
 	flag.StringVar(&config.DstMAC, "dstmac", config.DstMAC, "Destination MAC (optional, resolves via ARP if empty)")
 	flag.StringVar(&config.SrcIP, "srcip", config.SrcIP, "Source IP (optional, uses interface IP if empty)")
+
+	// Query configuration
 	flag.StringVar(&config.DomainName, "domain", config.DomainName, "Single domain to query (overridden by -domains)")
 	flag.DurationVar(&config.RetryTimeout, "retry-timeout", config.RetryTimeout, "Retry timeout")
-	flag.BoolVar(&config.Verbose, "verbose", config.Verbose, "Enable verbose logging")
-	flag.IntVar(&config.PollTimeoutMs, "poll", config.PollTimeoutMs, "XDP socket poll timeout (ms)")
-	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "File to save results (NDJSON)")
 	flag.IntVar(&config.Retries, "retries", config.Retries, "Retries per domain")
+
+	// Performance tuning
 	flag.IntVar(&config.MaxBatchSize, "maxbatch", config.MaxBatchSize, "Max XDP TX batch size")
+	flag.IntVar(&config.PollTimeoutMs, "poll", config.PollTimeoutMs, "XDP socket poll timeout (ms)")
+
+	// Output configuration
+	flag.StringVar(&config.OutputFile, "output", config.OutputFile, "File to save results")
 
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	if config.NIC == "" {
-		log.Fatal("Error: Network interface (-interface) is required")
+	// Handle version flag
+	if *showVersion {
+		fmt.Printf("PugDNS version %s\nBuild time: %s\nGit commit: %s\n", Version, BuildTime, GitCommit)
+		os.Exit(0)
 	}
 
-	if config.MaxBatchSize <= 0 {
-		log.Fatal("Error: Max batch size (-maxbatch) must be positive")
+	// Handle generate-config flag
+	if *generateConfig != "" {
+		if err := GenerateExampleConfig(*generateConfig); err != nil {
+			fmt.Fprintf(os.Stderr, "Error generating config file: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Example configuration written to %s\n", *generateConfig)
+		os.Exit(0)
+	}
+
+	// Load configuration from file if specified
+	if *configFile != "" {
+		fileConfig, err := LoadConfigFile(*configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error loading config file: %v\n", err)
+			os.Exit(1)
+		}
+		// Command-line flags override config file values
+		savedFlags := *config
+		*config = *fileConfig
+		// Restore command-line overrides
+		flag.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "interface":
+				config.NIC = savedFlags.NIC
+			case "verbose":
+				config.Verbose = savedFlags.Verbose
+			case "quiet":
+				config.Quiet = savedFlags.Quiet
+				// Add other overrides as needed
+			}
+		})
+	}
+
+	// Auto-discover interface if not specified
+	if config.NIC == "" {
+		appLogger.Info("Interface not specified, attempting to auto-discover...")
+		discoveredInterface, err := findDefaultInterface()
+		if err != nil {
+			appLogger.Fatal("Failed to auto-discover interface: %v. Please specify one using the -interface flag.", err)
+		}
+		config.NIC = discoveredInterface
+		appLogger.Success("✓ Discovered default interface: %s", config.NIC)
+	}
+
+	// Set log level and adjust for quiet mode
+	appLogger.SetLevel(LogLevelFromString(*logLevel))
+	if config.Quiet {
+		appLogger.SetLevel(ERROR)
+	}
+
+	// Initialize the sharded cache here, before any goroutines start.
+	cache = NewShardedHaxMap(uint32(runtime.NumCPU()))
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	if *pprofEnabled {
+		go func() {
+			appLogger.Info("Starting pprof server on http://localhost:6060/debug/pprof")
+			if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+				appLogger.Warn("Error starting pprof server: %v", err)
+			}
+		}()
+	}
+
+	// Validate configuration
+	if err := config.Validate(); err != nil {
+		appLogger.Fatal("Configuration error: %v", err)
+	}
+
+	// Perform dry-run checks if requested
+	if config.DryRun {
+		appLogger.Info("🔍 Running in dry-run mode - validating configuration...")
+
+		// Check interface exists
+		if _, err := netlink.LinkByName(config.NIC); err != nil {
+			appLogger.Error("Interface check failed: %v", err)
+			os.Exit(1)
+		}
+		appLogger.Success("✓ Network interface '%s' exists", config.NIC)
+
+		// Check domain file if specified
+		if *domainsFile != "" {
+			if _, err := os.Stat(*domainsFile); err != nil {
+				appLogger.Error("Domain file check failed: %v", err)
+				os.Exit(1)
+			}
+			count, err := countLines(*domainsFile)
+			if err != nil {
+				appLogger.Error("Failed to count domains: %v", err)
+				os.Exit(1)
+			}
+			appLogger.Success("✓ Domain file contains %d entries", count)
+		}
+
+		// Check nameservers are reachable
+		appLogger.Info("Checking nameserver connectivity...")
+		for _, ns := range config.Nameservers {
+			conn, err := net.DialTimeout("udp", ns+":53", 2*time.Second)
+			if err != nil {
+				appLogger.Warn("✗ Nameserver %s is not reachable: %v", ns, err)
+			} else {
+				conn.Close()
+				appLogger.Success("✓ Nameserver %s is reachable", ns)
+			}
+		}
+
+		// Estimate memory usage
+		if *domainsFile != "" {
+			count, _ := countLines(*domainsFile)
+			estimatedMem := (count * 100) / 1024 / 1024 // Rough estimate: 100 bytes per domain
+			appLogger.Info("📊 Estimated memory usage: ~%d MB", estimatedMem)
+		}
+
+		appLogger.Success("✓ Dry-run validation completed successfully!")
+		os.Exit(0)
 	}
 
 	shutdownChan := make(chan struct{})
@@ -1199,67 +1484,75 @@ func main() {
 
 	go func() {
 		sig := <-sigChan
-		log.Printf("Received signal: %v. Initiating graceful shutdown...", sig)
+		fmt.Println() // New line to clear any progress display
+		appLogger.Warn("🛑 Received %v signal. Initiating graceful shutdown...", sig)
+		appLogger.Info("⏳ Please wait while we clean up resources...")
 		close(shutdownChan)
 
-		<-time.After(5 * time.Second)
-		log.Println("Shutdown timeout reached. Forcing exit.")
+		// Give adequate time for cleanup
+		timeout := 15 * time.Second
+
+		<-time.After(timeout)
+		appLogger.Fatal("⚠️  Shutdown timeout reached after %v. Forcing exit.", timeout)
 		os.Exit(1)
 	}()
 
 	link, err := netlink.LinkByName(config.NIC)
 	if err != nil {
-		log.Fatalf("Error: couldn't find interface %s: %v", config.NIC, err)
+		appLogger.Fatal("couldn't find interface %s: %v", config.NIC, err)
 	}
 
 	if config.SrcIP == "" {
 		addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
 		if err != nil || len(addrs) == 0 {
-			log.Fatalf("Error: failed to get IPv4 address for interface %s: %v", config.NIC, err)
+			appLogger.Fatal("failed to get IPv4 address for interface %s: %v", config.NIC, err)
 		}
 		config.SrcIP = addrs[0].IP.String()
-		log.Printf("Using source IP %s from interface %s", config.SrcIP, config.NIC)
+		appLogger.Info("Using source IP %s from interface %s", config.SrcIP, config.NIC)
 	}
 
 	bpfExited := make(chan struct{})
 	go func() {
 		defer close(bpfExited)
 		BpfReceiver(config)
-		log.Println("BPF Receiver goroutine finished.")
+		appLogger.Info("BPF Receiver goroutine finished.")
 	}()
 	select {
 	case <-startedBPF:
-		log.Println("BPF receiver started successfully.")
+		appLogger.Success("BPF receiver started successfully.")
 	case <-time.After(5 * time.Second):
-		log.Fatal("Error: Timed out waiting for BPF receiver to start.")
+		appLogger.Fatal("Error: Timed out waiting for BPF receiver to start.")
 	}
 
-	var domains []string
-	if *domainsFile != "" {
-		loadedDomains, err := readDomainsFromFile(*domainsFile)
+	var totalDomainsInFile int // Declare here to be in scope for all branches
+
+	if *domainsFile == "" && config.DomainName == "" {
+		appLogger.Fatal("Error: Must provide a domain via -domain or a list via -domains")
+	} else if *domainsFile != "" {
+		appLogger.Info("Counting total domains in file for progress reporting...")
+		var err error
+		totalDomainsInFile, err = countLines(*domainsFile)
 		if err != nil {
-			log.Fatalf("Error reading domains file '%s': %v", *domainsFile, err)
+			appLogger.Fatal("Error counting lines in domains file: %v", err)
 		}
-		domains = loadedDomains
-		log.Printf("Read %d lines from %s", len(domains), *domainsFile)
-	} else if config.DomainName != "" {
-		domains = []string{config.DomainName}
-		log.Printf("Using single domain: %s", config.DomainName)
+		appLogger.Success("Found %d total domains.", totalDomainsInFile)
 	} else {
-		log.Fatal("Error: Must provide a domain via -domain or a list via -domains")
+		totalDomainsInFile = 1
 	}
 
 	if *nameserversFile != "" {
+		// This is a temporary solution for the nameservers file.
+		// A full streaming implementation for nameservers would be ideal in the future.
 		loadedNameservers, err := readDomainsFromFile(*nameserversFile)
 		if err != nil {
-			log.Fatalf("Error reading nameservers file '%s': %v", *nameserversFile, err)
+			appLogger.Fatal("Error reading nameservers file '%s': %v", *nameserversFile, err)
 		}
 		config.Nameservers = loadedNameservers
-		log.Printf("Loaded %d nameservers from %s", len(config.Nameservers), *nameserversFile)
+		appLogger.Success("Loaded %d nameservers from %s", len(config.Nameservers), *nameserversFile)
 	} else if len(config.Nameservers) > 0 {
-		log.Printf("Using default nameservers: %v", config.Nameservers)
+		appLogger.Info("Using default nameservers: %v", config.Nameservers)
 	} else {
-		log.Fatal("Error: No nameservers loaded or defined in default config.")
+		appLogger.Fatal("Error: No nameservers loaded or defined in default config.")
 	}
 
 	opts := &xdp.SocketOptions{
@@ -1270,39 +1563,56 @@ func main() {
 		RxRingNumDescs:         64,
 		TxRingNumDescs:         2048,
 	}
-	log.Printf("Initializing XDP socket on interface %s queue %d", config.NIC, config.QueueID)
+	appLogger.Info("Initializing XDP socket on interface %s queue %d", config.NIC, config.QueueID)
 	xsk, err := xdp.NewSocket(link.Attrs().Index, config.QueueID, opts)
 	if err != nil {
-		log.Fatalf("Error creating XDP socket on %s queue %d: %v. Ensure driver support and sufficient privileges.", config.NIC, config.QueueID, err)
+		appLogger.Fatal("Error creating XDP socket on %s queue %d: %v. Ensure driver support and sufficient privileges.", config.NIC, config.QueueID, err)
 	}
 	defer func() {
-		log.Println("Closing XDP socket...")
+		appLogger.Info("Closing XDP socket...")
 		xsk.Close()
-		log.Println("XDP socket closed.")
+		appLogger.Success("XDP socket closed.")
 	}()
 
-	log.Println("Starting packet transmission process...")
-	err = transmitPackets(xsk, domains, config, shutdownChan)
-	if err != nil {
-		log.Printf("Transmission process encountered an error: %v", err)
+	// Create error grouper for smart error categorization
+	errorGrouper := NewErrorGrouper()
+
+	appLogger.Info("Starting packet transmission process...")
+	if *domainsFile != "" {
+		err = transmitPackets(xsk, *domainsFile, config, shutdownChan, totalDomainsInFile, errorGrouper)
 	} else {
-		log.Println("Transmission process completed.")
+		// To handle the single-domain case without major refactoring of transmitPackets,
+		// we can wrap it in a temporary structure.
+		// A more elegant solution might be to have transmitPackets accept a channel directly.
+		tempDomainFile := "temp-single-domain.txt"
+		err = os.WriteFile(tempDomainFile, []byte(config.DomainName), 0644)
+		if err == nil {
+			err = transmitPackets(xsk, tempDomainFile, config, shutdownChan, totalDomainsInFile, errorGrouper)
+		}
+		os.Remove(tempDomainFile)
+	}
+	if err != nil {
+		appLogger.Error("Transmission process encountered an error: %v", err)
+	} else {
+		appLogger.Success("Transmission process completed.")
 	}
 
-	log.Println("Saving results from cache...")
-	saveCachePrettified(config)
-
-	log.Println("Signaling BPF receiver to stop...")
+	appLogger.Info("Signaling BPF receiver to stop...")
 	close(stopper)
-	log.Println("Waiting for BPF receiver to exit gracefully...")
+	appLogger.Info("Waiting for BPF receiver to exit gracefully...")
 	select {
 	case <-bpfExited:
-		log.Println("BPF receiver exited.")
+		appLogger.Success("BPF receiver exited.")
 	case <-time.After(5 * time.Second):
-		log.Println("Warning: Timed out waiting for BPF receiver to exit.")
+		appLogger.Warn("Timed out waiting for BPF receiver to exit.")
 	}
 
-	log.Println("PugDNS finished.")
+	// Display error summary if any errors occurred
+	if errorSummary := errorGrouper.GetSummary(); errorSummary != "" {
+		fmt.Print(errorSummary)
+	}
+
+	appLogger.Success("✨ PugDNS finished successfully!")
 }
 
 // --- Performance Analysis Utilities ---
@@ -1379,20 +1689,18 @@ func printPerformanceReport(config *Config) {
 		return statsList[i].Percentage > statsList[j].Percentage
 	})
 
-	var report strings.Builder
-	report.WriteString("\n")
+	appLogger.Info("--- Performance Analysis ---")
 	for _, stat := range statsList {
-		report.WriteString(fmt.Sprintf("%-20s: %6.2f%% | Avg: %-15s | Calls: %d\n",
-			stat.Name, stat.Percentage, stat.AvgTime, stat.Count))
+		appLogger.Info("%-20s: %6.2f%% | Avg: %-15s | Calls: %d",
+			stat.Name, stat.Percentage, stat.AvgTime, stat.Count)
 	}
-	log.Print(report.String())
 }
 
 func bottleneckReporter(ctx context.Context, config *Config) {
 	if !config.Verbose {
 		return
 	}
-	log.Println("Bottleneck reporter started.")
+	appLogger.Info("Bottleneck reporter started.")
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
@@ -1401,8 +1709,134 @@ func bottleneckReporter(ctx context.Context, config *Config) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			log.Println("--- Performance Analysis Tick ---")
 			printPerformanceReport(config)
 		}
 	}
+}
+
+func checkAndRetryDomains(ctx context.Context, domainStates *haxmap.Map[string, *DomainStatus], packetQueue chan<- PacketInfo, packetTemplate []byte, config *Config, rng *rand.Rand, failedDomainsList *[]string, writeChan chan<- []byte, finalDrain bool) (pendingCount int) {
+	defer timeOperation("Manager_RetryCheck")()
+	now := time.Now()
+	domainsToRetry := make(map[string]int) // map fqdn to current attempt count
+	domainsToRemove := []string{}
+	maxRetries := config.Retries + 1
+	var currentPending int
+
+	domainStates.ForEach(func(fqdn string, status *DomainStatus) bool {
+		status.mu.Lock()
+
+		if !status.Responded {
+			if _, found := cache.Get(fqdn); found {
+				status.Responded = true
+				atomic.AddUint64(&respondedDomainsCount, 1)
+
+				// Track first-attempt success rate
+				if status.AttemptsMade == 1 {
+					atomic.AddUint64(&firstAttemptSuccesses, 1)
+				} else if status.AttemptsMade > 1 {
+					// This domain required retries
+					atomic.AddUint64(&domainsRequiringRetries, 1)
+				}
+			}
+		}
+
+		if status.Responded {
+			domainsToRemove = append(domainsToRemove, fqdn)
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+		} else if status.AttemptsMade >= maxRetries {
+			domainsToRemove = append(domainsToRemove, fqdn)
+			*failedDomainsList = append(*failedDomainsList, fqdn)
+			atomic.AddUint64(&totalDomainsProcessed, 1)
+			// Count as requiring retries since it went through multiple attempts
+			if status.AttemptsMade > 1 {
+				atomic.AddUint64(&domainsRequiringRetries, 1)
+			}
+		} else if !status.LastAttempt.IsZero() && now.Sub(status.LastAttempt) > config.RetryTimeout {
+			domainsToRetry[fqdn] = status.AttemptsMade
+		} else {
+			currentPending++
+		}
+
+		status.mu.Unlock()
+		return true // Continue iteration
+	})
+
+	for _, fqdn := range domainsToRemove {
+		// For succeeded domains, send the payload to be written before deleting.
+		if payload, ok := cache.Get(fqdn); ok {
+			if finalDrain {
+				select {
+				case writeChan <- payload:
+				case <-ctx.Done():
+					// If context is cancelled during final drain, just stop sending.
+					return
+				}
+			} else {
+				writeChan <- payload
+			}
+		}
+		domainStates.Del(fqdn)
+		// Do not delete from cache, so we can use it for deduplication against the input file.
+		// cache.Del(fqdn)
+	}
+
+	if finalDrain {
+		// During the final drain, we don't want to retry domains, just collect pending ones.
+		domainStates.ForEach(func(fqdn string, status *DomainStatus) bool {
+			*failedDomainsList = append(*failedDomainsList, fqdn)
+			return true
+		})
+		return 0
+	}
+
+	queuedCount := 0
+	failedToPrepareCount := 0
+
+	if len(domainsToRetry) > 0 {
+		for fqdn, currentAttempt := range domainsToRetry {
+			// Check again right before sending to avoid race condition where
+			// a response arrived after the domain was added to the retry list.
+			if _, found := cache.Get(fqdn); found {
+				continue
+			}
+
+			currentNameserver := config.Nameservers[rng.Intn(len(config.Nameservers))]
+			dstIP := net.ParseIP(currentNameserver)
+			if dstIP == nil {
+				appLogger.Warn("Error preparing retry packet for %s: Invalid nameserver IP %s. Marking failed.", fqdn, currentNameserver)
+				failedToPrepareCount++
+				domainStates.Del(fqdn)
+				*failedDomainsList = append(*failedDomainsList, fqdn)
+				atomic.AddUint64(&totalDomainsProcessed, 1)
+				continue
+			}
+			packetBytes, err := prepareSinglePacket(packetTemplate, fqdn, dstIP, rng)
+			if err != nil {
+				appLogger.Warn("Error preparing retry packet for %s (attempt %d): %v. Marking failed.", fqdn, currentAttempt+1, err)
+				failedToPrepareCount++
+				domainStates.Del(fqdn)
+				*failedDomainsList = append(*failedDomainsList, fqdn)
+				atomic.AddUint64(&totalDomainsProcessed, 1)
+				continue
+			}
+
+			pktInfo := PacketInfo{Domain: fqdn, PacketBytes: packetBytes, Attempt: currentAttempt + 1}
+			packetQueue <- pktInfo
+			queuedCount++
+
+			// Track retry attempts
+			atomic.AddUint64(&totalRetryAttempts, 1)
+
+			if status, ok := domainStates.Get(fqdn); ok {
+				status.mu.Lock()
+				if !status.Responded {
+					status.AttemptsMade++
+					status.LastAttempt = time.Now()
+				}
+				status.mu.Unlock()
+			}
+		}
+	}
+
+	return int(domainStates.Len())
 }
