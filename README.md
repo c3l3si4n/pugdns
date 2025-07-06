@@ -18,27 +18,29 @@ The following benchmarks were performed on an AX42 Hetzner server (AMD Ryzen™ 
 *(Note: Benchmarks are indicative and can vary based on hardware, network conditions, and target nameservers. The original benchmarks were run on slightly different hardware but show the relative performance gains.)*
 
 ```bash
-Benchmark 1: cat wordlist.txt | dnsx -retry 1 -r resolvers.txt
-  Time (mean ± σ):     215.795 s ±  0.749 s    [User: 38.926 s, System: 46.179 s]
-  Range (min … max):   215.261 s … 216.651 s    3 runs
-
-Benchmark 2: cat wordlist.txt | zdns A --retries 1 --name-servers @resolvers.txt >/dev/null
-  Time (mean ± σ):     119.428 s ±  4.387 s    [User: 99.282 s, System: 32.637 s]
-  Range (min … max):   116.379 s … 124.455 s    3 runs
-
-Benchmark 3: massdns  -r resolvers.txt -s 12000 -c 1  wordlist.txt  >/dev/null
-  Time (mean ± σ):      5.584 s ±  0.036 s    [User: 1.354 s, System: 3.674 s]
-  Range (min … max):    5.547 s …  5.618 s    3 runs
-
-Benchmark 4: ././pugdns -interface enp6s0 -nameservers resolvers.txt  -retries 1 -domains wordlist.txt -retry-timeout 500ms -output /dev/null
-  Time (mean ± σ):      4.490 s ±  0.076 s    [User: 22.641 s, System: 5.136 s]
-  Range (min … max):    4.405 s …  4.552 s    3 runs
-
+Benchmark 1: cat b.txt | dnsx -retry 5 -r resolvers.txt
+  Time (mean ± σ):     19.744 s ±  0.086 s    [User: 2.908 s, System: 3.358 s]
+  Range (min … max):   19.634 s … 19.876 s    10 runs
+ 
+Benchmark 2: cat b.txt | zdns A --retries 5 --name-servers @resolvers.txt >/dev/null
+  Time (mean ± σ):     19.036 s ±  1.214 s    [User: 4.962 s, System: 2.022 s]
+  Range (min … max):   17.385 s … 21.283 s    10 runs
+ 
+Benchmark 3: massdns  -r resolvers.txt -s 12000 -c 5  b.txt  >/dev/null
+  Time (mean ± σ):      1.299 s ±  0.243 s    [User: 0.036 s, System: 0.137 s]
+  Range (min … max):    1.076 s …  1.583 s    10 runs
+ 
+  Warning: Statistical outliers were detected. Consider re-running this benchmark on a quiet system without any interferences from other programs. It might help to use the '--warmup' or '--prepare' options.
+ 
+Benchmark 4: ./pugdns -interface enp6s0 -nameservers resolvers.txt  -retries 5 -domains b.txt -retry-timeout 500ms -maxbatch 300000  -output /dev/null
+  Time (mean ± σ):     776.8 ms ±   7.6 ms    [User: 973.6 ms, System: 603.8 ms]
+  Range (min … max):   767.4 ms … 792.5 ms    10 runs
+ 
 Summary
-  ././pugdns -interface enp6s0 -nameservers resolvers.txt  -retries 1 -domains wordlist.txt -retry-timeout 500ms -output /dev/null ran
-    1.24 ± 0.02 times faster than massdns  -r resolvers.txt -s 12000 -c 1  wordlist.txt  >/dev/null
-   26.60 ± 1.08 times faster than cat wordlist.txt | zdns A --retries 1 --name-servers @resolvers.txt >/dev/null
-   48.06 ± 0.83 times faster than cat wordlist.txt | dnsx -retry 1 -r resolvers.txt
+  ./pugdns -interface enp6s0 -nameservers resolvers.txt  -retries 5 -domains b.txt -retry-timeout 500ms -maxbatch 300000  -output /dev/null ran
+    1.67 ± 0.31 times faster than massdns  -r resolvers.txt -s 12000 -c 5  b.txt  >/dev/null
+   24.50 ± 1.58 times faster than cat b.txt | zdns A --retries 5 --name-servers @resolvers.txt >/dev/null
+   25.42 ± 0.27 times faster than cat b.txt | dnsx -retry 5 -r resolvers.txt
 ```
 
 Looking into the accuracy and number of responses that came back, we had the following numbers testing with a 19966 domain wordlist:
