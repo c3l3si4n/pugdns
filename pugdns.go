@@ -1306,6 +1306,10 @@ func countLines(filename string) (int, error) {
 }
 
 func main() {
+	if os.Geteuid() != 0 {
+		log.Fatal("PugDNS requires root privileges. Please run with sudo.")
+	}
+
 	// Support environment variables
 	if envInterface := os.Getenv("PUGDNS_INTERFACE"); envInterface != "" {
 		os.Args = append(os.Args, "-interface", envInterface)
